@@ -422,8 +422,8 @@ static void applyDns() {
   IPAddress d0 = WiFi.dnsIP(0), d1 = WiFi.dnsIP(1);
   if (!(uint32_t)d0) d0 = IPAddress(1, 1, 1, 1);
   if (!(uint32_t)d1) d1 = IPAddress(8, 8, 8, 8);
-  dhcpSoftAP.dhcps_set_dns(0, d0);
-  dhcpSoftAP.dhcps_set_dns(1, d1);
+  WiFi.softAPDhcpServer().dhcps_set_dns(0, d0);
+  WiFi.softAPDhcpServer().dhcps_set_dns(1, d1);
 }
 
 static void startAp() {
