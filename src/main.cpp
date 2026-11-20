@@ -419,11 +419,13 @@ static IPAddress apIpWanted() {
 }
 
 static void applyDns() {
-  IPAddress d0 = WiFi.dnsIP(0), d1 = WiFi.dnsIP(1);
+  // This core's DHCP server hands out a single DNS address: use the upstream one.
+  IPAddress d0 = WiFi.dnsIP(0);
+  if (!(uint32_t)d0) d0 = WiFi.dnsIP(1);
   if (!(uint32_t)d0) d0 = IPAddress(1, 1, 1, 1);
-  if (!(uint32_t)d1) d1 = IPAddress(8, 8, 8, 8);
-  WiFi.softAPDhcpServer().setDns(0, d0);
-  WiFi.softAPDhcpServer().setDns(1, d1);
+  ip4_addr_t a;
+  a.addr = (uint32_t)d0;
+  WiFi.softAPDhcpServer().setDns(a);
 }
 
 static void startAp() {
