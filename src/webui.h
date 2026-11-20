@@ -118,6 +118,8 @@ p.hint{margin:8px 0 0;font-size:13px;color:var(--mute)}
 <p class="hint">8 to 63 characters. Leave empty to make the network open.</p></label>
 <label>Maximum clients<select id="maxc"></select></label>
 <label class="chk"><input type="checkbox" id="apHidden">Hide network name</label>
+<label class="chk" style="margin-top:12px"><input type="checkbox" id="apSetupOpen">Keep the access point open until connected</label>
+<p class="hint">While there is no upstream connection (at startup, or after the link is lost for a while) the access point has no password so you can reach this page. Once connected it switches to the password above and nearby clients must reconnect.</p>
 <div class="row" style="margin-top:20px"><button class="btn pri" id="saveAp">Save changes</button></div>
 <p class="hint">Saving restarts the access point. Reconnect to it afterwards.</p>
 </section>
@@ -206,7 +208,7 @@ dots($('#v_sig'),c?String(s.rssi):'--',4);$('#s_sig').textContent=c?'dBm, '+qual
 dots($('#v_bat'),s.batPresent?s.batPct+'%':'USB',4);$('#s_bat').textContent=s.batPresent?(s.batMv/1000).toFixed(2)+' V':'No battery';
 dots($('#v_cli'),String(s.clients),4);$('#s_cli').textContent=s.repeater?'Repeater on':'Repeater off';
 hist.push(c?s.rssi:null);if(hist.length>HN)hist.shift();drawHist();
-const kv=[['Upstream network',s.ssid||'None'],['Upstream address',c?s.ip:'-'],['Gateway',c?s.gw:'-'],['Access point',s.apSsid],['Web UI address',s.apIp],['Free memory',(s.heap/1024).toFixed(1)+' KB'],['Uptime',upt(s.uptime)]];
+const kv=[['Upstream network',s.ssid||'None'],['Upstream address',c?s.ip:'-'],['Gateway',c?s.gw:'-'],['Access point',s.apSsid+(s.apOpen?' (open, setup mode)':'')],['Web UI address',s.apIp],['Free memory',(s.heap/1024).toFixed(1)+' KB'],['Uptime',upt(s.uptime)]];
 $('#kv').innerHTML=kv.map(r=>'<dt>'+r[0]+'</dt><dd>'+esc(r[1])+'</dd>').join('');
 $('#sv').textContent=s.saved||'None';$('#forget').hidden=!s.saved;$('#ver').textContent='Firmware '+s.fw;
 $('#ledNow').textContent='Showing now: '+s.led;
@@ -243,12 +245,12 @@ $('#ledCount').innerHTML=[1,2,3,4,5,6,7,8].map(n=>'<option>'+n+'</option>').join
 $('#bri').oninput=()=>$('#briv').textContent=$('#bri').value+'%';
 $('#ledBright').oninput=()=>$('#ledv').textContent=$('#ledBright').value+'%';
 async function loadCfg(){try{const c=await api('/api/config');
-$('#apSsid').value=c.apSsid;$('#apPass').value=c.apPass;$('#apHidden').checked=!!c.apHidden;$('#maxc').value=c.maxClients;
+$('#apSsid').value=c.apSsid;$('#apPass').value=c.apPass;$('#apHidden').checked=!!c.apHidden;$('#apSetupOpen').checked=!!c.apSetupOpen;$('#maxc').value=c.maxClients;
 $('#bri').value=c.brightness;$('#briv').textContent=c.brightness+'%';$('#tmo').value=c.timeout;$('#flip').checked=!!c.flip;
 $('#ledMode').value=c.ledMode;$('#ledBright').value=c.ledBright;$('#ledv').textContent=c.ledBright+'%';$('#ledCount').value=c.ledCount;$('#adcFullMv').value=c.adcFullMv;
 PINS.forEach(k=>$('#p_'+k[0]).value=c.pins[k[0]])}catch(e){toast(e.message,1)}}
 const pk=k=>'p'+k[0].toUpperCase()+k.slice(1);
-$('#saveAp').onclick=async()=>{try{const r=await api('/api/config',{apSsid:$('#apSsid').value,apPass:$('#apPass').value,apHidden:$('#apHidden').checked?1:0,maxClients:$('#maxc').value});
+$('#saveAp').onclick=async()=>{try{const r=await api('/api/config',{apSsid:$('#apSsid').value,apPass:$('#apPass').value,apHidden:$('#apHidden').checked?1:0,apSetupOpen:$('#apSetupOpen').checked?1:0,maxClients:$('#maxc').value});
 toast(r.apRestart?'Saved. The access point is restarting.':'Saved')}catch(e){toast(e.message,1)}};
 $('#saveDev').onclick=async()=>{const b={brightness:$('#bri').value,timeout:$('#tmo').value,flip:$('#flip').checked?1:0,
 ledMode:$('#ledMode').value,ledBright:$('#ledBright').value,ledCount:$('#ledCount').value,adcFullMv:$('#adcFullMv').value};

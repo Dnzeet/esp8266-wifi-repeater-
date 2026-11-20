@@ -20,7 +20,7 @@ extern "C" {
 
 #define NAPT_ENTRIES 512
 #define NAPT_PORTS   10
-#define CFG_MAGIC    0x52505433u
+#define CFG_MAGIC    0x52505434u
 
 // ===================================================================
 //  Config
@@ -35,6 +35,7 @@ struct Config {
   char apSsid[33];
   char apPass[65];
   uint8_t apHidden;
+  uint8_t apSetupOpen;  // keep the AP open (no password) until the upstream link is up
   uint8_t maxClients;
   uint8_t repeater;
   uint8_t brightness;   // OLED, percent 5..100
@@ -66,6 +67,7 @@ static void cfgDefaults() {
   strlcpy(cfg.apSsid, "ESP-Repeater", sizeof(cfg.apSsid));
   strlcpy(cfg.apPass, "repeater123", sizeof(cfg.apPass));
   cfg.maxClients = 4;
+  cfg.apSetupOpen = 1;
   cfg.repeater = 1;
   cfg.brightness = 70;
   cfg.timeoutSec = 30;
@@ -113,6 +115,7 @@ static void cfgLoad() {
   if (!cfg.apSsid[0]) strlcpy(cfg.apSsid, "ESP-Repeater", sizeof(cfg.apSsid));
   if (cfg.brightness < 5 || cfg.brightness > 100) cfg.brightness = 70;
   if (cfg.maxClients < 1 || cfg.maxClients > 8) cfg.maxClients = 4;
+  if (cfg.apSetupOpen > 1) cfg.apSetupOpen = 1;
   if (cfg.ledMode > 3) cfg.ledMode = 1;
   if (cfg.ledBright < 5 || cfg.ledBright > 100) cfg.ledBright = 40;
   if (cfg.ledCount < 1 || cfg.ledCount > 8) cfg.ledCount = 1;
@@ -160,6 +163,8 @@ static char pendSsid[33], pendPass[65], connectedSsid[33], failReason[24];
 static bool pendSave = false;
 
 static uint32_t rebootAt = 0, apRestartAt = 0;
+static bool apIsOpen = false, everConnected = false;
+static uint32_t lastConnAt = 0;
 
 static char kbBuf[64], kbSsid[33];
 static bool kbShow = false;
@@ -428,11 +433,21 @@ static void applyDns() {
   WiFi.softAPDhcpServer().setDns(a);
 }
 
+// Setup mode: the AP has no password until the upstream link is up (or after it has been lost for a while).
+static bool apWantOpen() {
+  if (!cfg.apPass[0]) return true;
+  if (!cfg.apSetupOpen) return false;
+  if (cs == CS_CONNECTED) return false;
+  if (!everConnected) return true;
+  return millis() - lastConnAt > 15000;
+}
+
 static void startAp() {
   IPAddress ip = apIpWanted();
   WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0));
   int ch = (cs == CS_CONNECTED) ? WiFi.channel() : 1;
-  WiFi.softAP(cfg.apSsid, cfg.apPass[0] ? cfg.apPass : nullptr, ch, cfg.apHidden, cfg.maxClients);
+  apIsOpen = apWantOpen();
+  WiFi.softAP(cfg.apSsid, apIsOpen ? nullptr : cfg.apPass, ch, cfg.apHidden, cfg.maxClients);
   applyDns();
 }
 
@@ -474,6 +489,8 @@ static void cancelConnect() {
 
 static void onConnected() {
   cs = CS_CONNECTED;
+  everConnected = true;
+  lastConnAt = millis();
   failReason[0] = 0;
   strlcpy(connectedSsid, WiFi.SSID().c_str(), sizeof(connectedSsid));
   if (pendSave) {
@@ -501,6 +518,7 @@ static void pollWifi() {
       else if (now - csSince > 25000) failConnect("Timed out");
       break;
     case CS_CONNECTED:
+      if (st == WL_CONNECTED) lastConnAt = now;
       if (st != WL_CONNECTED) {
         cs = CS_CONNECTING;
         csSince = now;
@@ -960,7 +978,7 @@ static void drawLed() {
   }
 }
 
-#define INFO_N 9
+#define INFO_N 10
 static void infoItem(int i, char *l, char *v) {
   bool c = (cs == CS_CONNECTED);
   uint32_t s = millis() / 1000;
@@ -984,6 +1002,7 @@ static void infoItem(int i, char *l, char *v) {
       if (s >= 86400) snprintf(v, 24, "%ud %02uh %02um", (unsigned)(s / 86400), (unsigned)((s / 3600) % 24), (unsigned)((s / 60) % 60));
       else snprintf(v, 24, "%02u:%02u:%02u", (unsigned)(s / 3600), (unsigned)((s / 60) % 60), (unsigned)(s % 60));
       break;
+    case 8: strcpy(l, "AP security"); strcpy(v, apIsOpen ? "Open (setup)" : "Password"); break;
     default: strcpy(l, "Firmware"); strlcpy(v, FW_VERSION, 24); break;
   }
 }
@@ -1368,6 +1387,7 @@ static void hStatus() {
   o += ",\"channel\":"; o += c ? WiFi.channel() : 0;
   o += ",\"clients\":"; o += (int)WiFi.softAPgetStationNum();
   o += ",\"repeater\":"; o += cfg.repeater ? "true" : "false";
+  o += ",\"apOpen\":"; o += apIsOpen ? "true" : "false";
   o += ",\"batPresent\":"; o += batPresent ? "true" : "false";
   o += ",\"batMv\":"; o += (int)batMv;
   o += ",\"batPct\":"; o += (int)batPct;
@@ -1484,6 +1504,7 @@ static void hCfgGet() {
   jStr(o, "apSsid", cfg.apSsid); o += ',';
   jStr(o, "apPass", cfg.apPass);
   o += ",\"apHidden\":"; o += (int)cfg.apHidden;
+  o += ",\"apSetupOpen\":"; o += (int)cfg.apSetupOpen;
   o += ",\"maxClients\":"; o += (int)cfg.maxClients;
   o += ",\"brightness\":"; o += (int)cfg.brightness;
   o += ",\"timeout\":"; o += (int)cfg.timeoutSec;
@@ -1521,6 +1542,7 @@ static void hCfgPost() {
     uint8_t h = server.arg("apHidden") == "1";
     if (h != n.apHidden) { n.apHidden = h; apCh = true; }
   }
+  if (!err && server.hasArg("apSetupOpen")) n.apSetupOpen = server.arg("apSetupOpen") == "1";
   if (!err && server.hasArg("maxClients")) {
     int m = server.arg("maxClients").toInt();
     if (m < 1 || m > 8) err = "Maximum clients must be 1-8";
@@ -1658,6 +1680,12 @@ void loop() {
   uiDraw();
 
   uint32_t now = millis();
+  static uint32_t apChk = 0;
+  if (now - apChk > 1000) {
+    apChk = now;
+    bool want = apWantOpen();
+    if (!apRestartAt && want != apIsOpen) apRestartAt = now + (want ? 200 : 2000);
+  }
   if (apRestartAt && (int32_t)(now - apRestartAt) >= 0) { apRestartAt = 0; startAp(); }
   if (rebootAt && (int32_t)(now - rebootAt) >= 0) ESP.restart();
   delay(2);
