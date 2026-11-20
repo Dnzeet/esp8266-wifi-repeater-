@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 #include <U8g2lib.h>
@@ -582,6 +583,8 @@ static void onConnected() {
   doneAt = millis();
   dirty = true;
 }
+
+static void startScan();
 
 static void pollWifi() {
   uint32_t now = millis();
@@ -1957,12 +1960,13 @@ static bool dnsQuery(IPAddress srv, uint16_t &ms) {
 static void inetProbe() {
   WiFiClient c;
   uint32_t t = millis();
-  bool ok = c.connect(IPAddress(1, 1, 1, 1), 443, 1200);
+  c.setTimeout(1200);
+  bool ok = c.connect(IPAddress(1, 1, 1, 1), 443);
   uint32_t ping = millis() - t;
   c.stop();
   if (!ok) {
     t = millis();
-    ok = c.connect(IPAddress(8, 8, 8, 8), 443, 1200);
+    ok = c.connect(IPAddress(8, 8, 8, 8), 443);
     ping = millis() - t;
     c.stop();
   }
@@ -1981,7 +1985,8 @@ static bool speedTry(const char *host, uint32_t &kbps) {
   IPAddress ip;
   if (!WiFi.hostByName(host, ip, 3000)) { strlcpy(speedMsg, "DNS lookup failed", sizeof(speedMsg)); return false; }
   WiFiClient c;
-  if (!c.connect(ip, 80, 3000)) { strlcpy(speedMsg, "No connection", sizeof(speedMsg)); return false; }
+  c.setTimeout(3000);
+  if (!c.connect(ip, 80)) { strlcpy(speedMsg, "No connection", sizeof(speedMsg)); return false; }
   c.print(String("GET /10MB.zip HTTP/1.0\r\nHost: ") + host + "\r\nConnection: close\r\nUser-Agent: repeater\r\n\r\n");
 
   char first[16] = {0};
