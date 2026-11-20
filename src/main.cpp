@@ -20,7 +20,7 @@ extern "C" {
 
 #define NAPT_ENTRIES 512
 #define NAPT_PORTS   10
-#define CFG_MAGIC    0x52505434u
+#define CFG_MAGIC    0x52505435u
 
 // ===================================================================
 //  Config
@@ -28,14 +28,18 @@ extern "C" {
 enum Btn : uint8_t { B_UP, B_DOWN, B_LEFT, B_RIGHT, B_OK, B_BACK, B_COUNT };
 enum PinRole : uint8_t { P_UP, P_DOWN, P_LEFT, P_RIGHT, P_OK, P_BACK, P_SDA, P_SCL, P_LED, P_COUNT };
 
+#define MAX_SAVED 8
+struct SavedNet { char ssid[33]; char pass[65]; };
+
 struct Config {
   uint32_t magic;
-  char staSsid[33];
-  char staPass[65];
+  SavedNet saved[MAX_SAVED];  // remembered uplinks, most recently used first
   char apSsid[33];
   char apPass[65];
   uint8_t apHidden;
   uint8_t apSetupOpen;  // keep the AP open (no password) until the upstream link is up
+  uint8_t dnsMode;      // DNS handed to clients: 0 upstream, 1-4 presets, 5 custom
+  uint8_t dnsCustom[4];
   uint8_t maxClients;
   uint8_t repeater;
   uint8_t brightness;   // OLED, percent 5..100
@@ -108,14 +112,16 @@ static int timeoutIdx() {
 }
 
 static void cfgLoad() {
-  EEPROM.begin(512);
+  EEPROM.begin(2048);
   EEPROM.get(0, cfg);
   if (cfg.magic != CFG_MAGIC) { cfgDefaults(); cfgSave(); }
-  cfg.staSsid[32] = 0; cfg.staPass[64] = 0; cfg.apSsid[32] = 0; cfg.apPass[64] = 0;
+  for (int i = 0; i < MAX_SAVED; i++) { cfg.saved[i].ssid[32] = 0; cfg.saved[i].pass[64] = 0; }
+  cfg.apSsid[32] = 0; cfg.apPass[64] = 0;
   if (!cfg.apSsid[0]) strlcpy(cfg.apSsid, "ESP-Repeater", sizeof(cfg.apSsid));
   if (cfg.brightness < 5 || cfg.brightness > 100) cfg.brightness = 70;
   if (cfg.maxClients < 1 || cfg.maxClients > 8) cfg.maxClients = 4;
   if (cfg.apSetupOpen > 1) cfg.apSetupOpen = 1;
+  if (cfg.dnsMode > 5) cfg.dnsMode = 0;
   if (cfg.ledMode > 3) cfg.ledMode = 1;
   if (cfg.ledBright < 5 || cfg.ledBright > 100) cfg.ledBright = 40;
   if (cfg.ledCount < 1 || cfg.ledCount > 8) cfg.ledCount = 1;
@@ -127,14 +133,70 @@ static void cfgLoad() {
 }
 
 // ===================================================================
+//  Saved networks and DNS choice
+// ===================================================================
+static bool haveSaved() { return cfg.saved[0].ssid[0] != 0; }
+
+static int savedN() {
+  int n = 0;
+  for (int i = 0; i < MAX_SAVED; i++) if (cfg.saved[i].ssid[0]) n++;
+  return n;
+}
+
+static int savedFind(const char *ssid) {
+  for (int i = 0; i < MAX_SAVED; i++)
+    if (cfg.saved[i].ssid[0] && !strcmp(cfg.saved[i].ssid, ssid)) return i;
+  return -1;
+}
+
+static void savedPromote(int i) {
+  if (i <= 0) return;
+  SavedNet t = cfg.saved[i];
+  for (int j = i; j > 0; j--) cfg.saved[j] = cfg.saved[j - 1];
+  cfg.saved[0] = t;
+}
+
+static void savedAdd(const char *ssid, const char *pass) {
+  int i = savedFind(ssid);
+  if (i < 0) {
+    for (i = 0; i < MAX_SAVED; i++) if (!cfg.saved[i].ssid[0]) break;
+    if (i >= MAX_SAVED) i = MAX_SAVED - 1;
+    memset(&cfg.saved[i], 0, sizeof(SavedNet));
+    strlcpy(cfg.saved[i].ssid, ssid, sizeof(cfg.saved[i].ssid));
+  }
+  strlcpy(cfg.saved[i].pass, pass, sizeof(cfg.saved[i].pass));
+  savedPromote(i);
+}
+
+static void savedRemove(int i) {
+  for (int j = i; j < MAX_SAVED - 1; j++) cfg.saved[j] = cfg.saved[j + 1];
+  memset(&cfg.saved[MAX_SAVED - 1], 0, sizeof(SavedNet));
+}
+
+static const uint8_t DNS_P[5][4] = {{0, 0, 0, 0}, {1, 1, 1, 1}, {8, 8, 8, 8}, {9, 9, 9, 9}, {94, 140, 14, 14}};
+static const char *const DNS_NAME[6] = {"Upstream (auto)", "Cloudflare", "Google", "Quad9", "AdGuard", "Custom"};
+static const char *const DNS_SHORT[6] = {"Auto", "CF", "Google", "Quad9", "AdGuard", "Custom"};
+
+static bool customSet() { return cfg.dnsCustom[0] || cfg.dnsCustom[1] || cfg.dnsCustom[2] || cfg.dnsCustom[3]; }
+
+static IPAddress dnsEffective() {
+  if (cfg.dnsMode >= 1 && cfg.dnsMode <= 4) return IPAddress(DNS_P[cfg.dnsMode][0], DNS_P[cfg.dnsMode][1], DNS_P[cfg.dnsMode][2], DNS_P[cfg.dnsMode][3]);
+  if (cfg.dnsMode == 5 && customSet()) return IPAddress(cfg.dnsCustom[0], cfg.dnsCustom[1], cfg.dnsCustom[2], cfg.dnsCustom[3]);
+  IPAddress d = WiFi.dnsIP(0);
+  if (!(uint32_t)d) d = WiFi.dnsIP(1);
+  if (!(uint32_t)d) d = IPAddress(1, 1, 1, 1);
+  return d;
+}
+
+// ===================================================================
 //  Shared state
 // ===================================================================
 enum Screen : uint8_t {
   SC_SPLASH, SC_HOME, SC_MENU, SC_NETS, SC_KEYS, SC_CONNECT,
-  SC_DISPLAY, SC_LED, SC_INFO, SC_CONFIRM, SC_MESSAGE
+  SC_DISPLAY, SC_LED, SC_INFO, SC_CONFIRM, SC_MESSAGE, SC_SAVED, SC_SPEED
 };
 enum ConnState : uint8_t { CS_IDLE, CS_CONNECTING, CS_CONNECTED, CS_FAILED };
-enum ConfirmKind : uint8_t { CF_FORGET, CF_RESTART };
+enum ConfirmKind : uint8_t { CF_SAVED, CF_RESTART };
 
 struct ListState { int sel; int top; };
 struct Net { char ssid[33]; int8_t rssi; uint8_t enc; };
@@ -150,9 +212,10 @@ static uint32_t splashUntil = 0;
 static bool dirty = true;
 static bool cfgDirty = false;
 static uint32_t lastDraw = 0;
-static ListState menuL, netL, dispL, ledL, infoL;
+static ListState menuL, netL, dispL, ledL, infoL, savedL;
 static ConfirmKind confirmKind;
 static bool confirmYes = false;
+static int confirmIdx = 0;
 static char toastMsg[28];
 static uint32_t toastUntil = 0;
 static char msg1[24], msg2[40];
@@ -165,6 +228,15 @@ static bool pendSave = false;
 static uint32_t rebootAt = 0, apRestartAt = 0;
 static bool apIsOpen = false, everConnected = false;
 static uint32_t lastConnAt = 0;
+static bool autoScan = false, autoTried = false;
+static bool inetKnown = false, inetOk = false, dnsOk = false;
+static uint16_t pingMs = 0, dnsMs = 0;
+static uint32_t inetNext = 0;
+static uint8_t speedState = 0;  // 0 none, 1 running, 2 done, 3 failed
+static bool speedPending = false;
+static uint32_t speedKbps = 0, speedLiveKbps = 0;
+static uint8_t speedPct = 0;
+static char speedMsg[24];
 
 static char kbBuf[64], kbSsid[33];
 static bool kbShow = false;
@@ -236,6 +308,9 @@ static const uint8_t IC_LED[] PROGMEM = {0x3c, 0x42, 0x42, 0x42, 0x24, 0x3c, 0x3
 static const uint8_t IC_INFO[] PROGMEM = {0x3c, 0x42, 0x99, 0x81, 0x99, 0x99, 0x42, 0x3c};
 static const uint8_t IC_X[] PROGMEM = {0x81, 0xc3, 0x66, 0x3c, 0x3c, 0x66, 0xc3, 0x81};
 static const uint8_t IC_REFRESH[] PROGMEM = {0x3c, 0x42, 0xe1, 0x41, 0x01, 0x42, 0x3c, 0x00};
+static const uint8_t IC_STAR[] PROGMEM = {0x18, 0x18, 0xff, 0x7e, 0x3c, 0x66, 0x42, 0x00};
+static const uint8_t IC_GLOBE[] PROGMEM = {0x3c, 0x5a, 0x99, 0xff, 0x99, 0x5a, 0x3c, 0x00};
+static const uint8_t IC_BOLT[] PROGMEM = {0x30, 0x18, 0x0c, 0x7e, 0x18, 0x0c, 0x06, 0x00};
 
 static void applyBrightness() {
   if (oled) oled->setContrast((uint8_t)(2 + (uint32_t)cfg.brightness * 253 / 100));
@@ -424,12 +499,9 @@ static IPAddress apIpWanted() {
 }
 
 static void applyDns() {
-  // This core's DHCP server hands out a single DNS address: use the upstream one.
-  IPAddress d0 = WiFi.dnsIP(0);
-  if (!(uint32_t)d0) d0 = WiFi.dnsIP(1);
-  if (!(uint32_t)d0) d0 = IPAddress(1, 1, 1, 1);
+  // This core's DHCP server hands out a single DNS address.
   ip4_addr_t a;
-  a.addr = (uint32_t)d0;
+  a.addr = (uint32_t)dnsEffective();
   WiFi.softAPDhcpServer().setDns(a);
 }
 
@@ -494,11 +566,15 @@ static void onConnected() {
   failReason[0] = 0;
   strlcpy(connectedSsid, WiFi.SSID().c_str(), sizeof(connectedSsid));
   if (pendSave) {
-    strlcpy(cfg.staSsid, pendSsid, sizeof(cfg.staSsid));
-    strlcpy(cfg.staPass, pendPass, sizeof(cfg.staPass));
+    savedAdd(pendSsid, pendPass);
     cfgSave();
     pendSave = false;
+  } else {
+    int si = savedFind(connectedSsid);
+    if (si > 0) { savedPromote(si); cfgSave(); }
   }
+  inetKnown = false;
+  inetNext = millis() + 3000;
   kbBuf[0] = 0;
   if (WiFi.softAPIP() != apIpWanted()) startAp();
   else applyDns();
@@ -523,15 +599,32 @@ static void pollWifi() {
         cs = CS_CONNECTING;
         csSince = now;
         pendSave = false;
+        inetKnown = false;
         strlcpy(pendSsid, connectedSsid, sizeof(pendSsid));
         dirty = true;
       }
       break;
     default:
-      if (cfg.staSsid[0] && (int32_t)(now - nextRetry) >= 0 && screen != SC_CONNECT && screen != SC_KEYS)
-        staConnect(cfg.staSsid, cfg.staPass, false);
+      if (haveSaved() && !autoScan && (int32_t)(now - nextRetry) >= 0 && screen != SC_CONNECT && screen != SC_KEYS) {
+        // do not disturb someone using the setup page: only the first attempt scans with clients attached
+        if (autoTried && WiFi.softAPgetStationNum() > 0) { nextRetry = now + 30000; break; }
+        autoTried = true;
+        autoScan = true;
+        startScan();
+      }
       break;
   }
+}
+
+// Picks the strongest visible saved network after a scan.
+static void autoConnect() {
+  int best = -1, bestR = -999;
+  for (int i = 0; i < netCount; i++) {
+    int si = savedFind(nets[i].ssid);
+    if (si >= 0 && nets[i].rssi > bestR) { best = si; bestR = nets[i].rssi; }
+  }
+  if (best >= 0) staConnect(cfg.saved[best].ssid, cfg.saved[best].pass, false);
+  else { failConnect("None in range"); nextRetry = millis() + 45000; }
 }
 
 static void startScan() {
@@ -547,7 +640,7 @@ static void pollScan() {
   if (!scanning) return;
   int n = WiFi.scanComplete();
   if (n == WIFI_SCAN_RUNNING) {
-    if (millis() - scanStart > 15000) { scanning = false; WiFi.scanDelete(); dirty = true; }
+    if (millis() - scanStart > 15000) { scanning = false; WiFi.scanDelete(); dirty = true; if (autoScan) { autoScan = false; nextRetry = millis() + 30000; } }
     return;
   }
   scanning = false;
@@ -576,6 +669,7 @@ static void pollScan() {
   netL.sel = 0;
   netL.top = 0;
   dirty = true;
+  if (autoScan) { autoScan = false; autoConnect(); }
 }
 
 // ===================================================================
@@ -606,6 +700,7 @@ static RGB scale(RGB c, uint8_t v) { return RGB{(uint8_t)(c.r * v / 255), (uint8
 static RGB ledConnection(const char **label) {
   switch (cs) {
     case CS_CONNECTED:
+      if (inetKnown && !inetOk) { *label = "Connected, no internet"; return RGB{255, 90, 0}; }
       if (cfg.repeater) { *label = "Connected, repeating"; return RGB{0, 200, 40}; }
       *label = "Connected, repeater off";
       return RGB{0, 70, 255};
@@ -616,7 +711,7 @@ static RGB ledConnection(const char **label) {
       *label = "Connection failed";
       return scale(RGB{255, 0, 0}, 60 + tri(1600) * 195 / 255);
     default:
-      if (cfg.staSsid[0]) { *label = "Not connected"; return scale(RGB{255, 0, 0}, 40 + tri(2400) * 100 / 255); }
+      if (haveSaved()) { *label = "Not connected"; return scale(RGB{255, 0, 0}, 40 + tri(2400) * 100 / 255); }
       *label = "Not set up";
       return scale(RGB{130, 0, 255}, 30 + tri(3000) * 150 / 255);
   }
@@ -713,13 +808,13 @@ static void drawHome() {
   bars(2, 8, conn ? rssiLevel(WiFi.RSSI()) : 0);
   char b[40];
   if (conn) snprintf(b, sizeof(b), "ch%d %ddBm", (int)WiFi.channel(), (int)WiFi.RSSI());
-  else strcpy(b, cs == CS_CONNECTING ? "searching" : "no uplink");
+  else strcpy(b, (cs == CS_CONNECTING || autoScan) ? "searching" : "no uplink");
   oled->drawStr(20, 8, b);
   drawBattery(125);
   oled->drawHLine(0, 11, 128);
 
   // upstream network and address
-  const char *shown = conn ? connectedSsid : ((cs != CS_IDLE && pendSsid[0]) ? pendSsid : cfg.staSsid);
+  const char *shown = conn ? connectedSsid : ((cs != CS_IDLE && pendSsid[0]) ? pendSsid : cfg.saved[0].ssid);
   oled->setFont(F_BIG);
   fit(shown[0] ? shown : "No network", b, sizeof(b), 124);
   oled->drawStr(2, 25, b);
@@ -728,8 +823,26 @@ static void drawHome() {
   if (conn) strlcpy(l2, WiFi.localIP().toString().c_str(), sizeof(l2));
   else if (cs == CS_CONNECTING) snprintf(l2, sizeof(l2), "Connecting%.*s", (int)((millis() / 400) % 4), "...");
   else if (cs == CS_FAILED) strlcpy(l2, failReason, sizeof(l2));
-  else strlcpy(l2, cfg.staSsid[0] ? "Disconnected" : "OK > Networks", sizeof(l2));
+  else if (autoScan) strlcpy(l2, "Searching saved", sizeof(l2));
+  else strlcpy(l2, haveSaved() ? "Disconnected" : "OK > Networks", sizeof(l2));
   oled->drawStr(2, 37, l2);
+
+  // internet status: globe with latency (alternating with the last speed test), or a cross
+  if (conn && inetKnown) {
+    char t[12];
+    if (inetOk) {
+      oled->drawXBMP(92, 29, 8, 8, IC_GLOBE);
+      bool showSpeed = speedState == 2 && speedKbps > 0 && ((millis() / 3000) % 2);
+      if (showSpeed) snprintf(t, sizeof(t), "%u.%uM", (unsigned)(speedKbps / 1000), (unsigned)((speedKbps % 1000) / 100));
+      else if (!dnsOk) strcpy(t, "DNS!");
+      else snprintf(t, sizeof(t), "%ums", (unsigned)pingMs);
+    } else {
+      oled->drawXBMP(92, 29, 8, 8, IC_X);
+      strcpy(t, "none");
+    }
+    oled->setFont(F_SM);
+    oled->drawStr(102, 36, t);
+  }
 
   // traffic path: uplink -> repeater -> clients
   oled->drawFrame(4, 48, 24, 6);
@@ -738,7 +851,7 @@ static void drawHome() {
   oled->drawPixel(8, 51);
   if (conn) oled->drawPixel(11, 51);
   oled->setFont(F_SM);
-  centerText(16, 62, conn ? "UPLINK" : "NO LINK");
+  centerText(16, 62, conn ? ((inetKnown && !inetOk) ? "NO NET" : "UPLINK") : "NO LINK");
 
   oled->drawFrame(56, 42, 16, 11);
   for (int i = 0; i < 3; i++) { oled->drawHLine(53, 44 + i * 3, 3); oled->drawHLine(72, 44 + i * 3, 3); }
@@ -758,18 +871,20 @@ static void drawHome() {
   drawArrow(77, 93, 47, live && n > 0);
 }
 
-#define MENU_N 7
-static const uint8_t *const MENU_ICON[MENU_N] = {IC_WIFI, IC_POWER, IC_SUN, IC_LED, IC_INFO, IC_X, IC_REFRESH};
+#define MENU_N 9
+static const uint8_t *const MENU_ICON[MENU_N] = {IC_WIFI, IC_STAR, IC_POWER, IC_GLOBE, IC_SUN, IC_LED, IC_BOLT, IC_INFO, IC_REFRESH};
 
 static void menuItem(int i, char *l, char *v) {
   v[0] = 0;
   switch (i) {
     case 0: strcpy(l, "Networks"); break;
-    case 1: strcpy(l, "Repeater"); strcpy(v, cfg.repeater ? "ON" : "OFF"); break;
-    case 2: strcpy(l, "Display"); break;
-    case 3: strcpy(l, "LED"); strcpy(v, LED_MODE_SHORT[cfg.ledMode]); break;
-    case 4: strcpy(l, "Info"); break;
-    case 5: strcpy(l, "Forget network"); break;
+    case 1: strcpy(l, "Saved"); snprintf(v, 8, "%d", savedN()); break;
+    case 2: strcpy(l, "Repeater"); strcpy(v, cfg.repeater ? "ON" : "OFF"); break;
+    case 3: strcpy(l, "DNS"); strlcpy(v, DNS_SHORT[cfg.dnsMode], 8); break;
+    case 4: strcpy(l, "Display"); break;
+    case 5: strcpy(l, "LED"); strcpy(v, LED_MODE_SHORT[cfg.ledMode]); break;
+    case 6: strcpy(l, "Speed test"); break;
+    case 7: strcpy(l, "Info"); break;
     default: strcpy(l, "Restart"); break;
   }
 }
@@ -811,6 +926,7 @@ static void drawNets() {
     if (i < netCount) {
       bool cur = (cs == CS_CONNECTED && !strcmp(nets[i].ssid, connectedSsid));
       if (cur) drawTick(2, y + 3);
+      else if (savedFind(nets[i].ssid) >= 0) oled->drawXBMP(2, y + 2, 8, 8, IC_STAR);
       else if (nets[i].enc) drawLock(3, y + 3);
       char buf[40];
       fit(nets[i].ssid, buf, sizeof(buf), 68);
@@ -978,7 +1094,7 @@ static void drawLed() {
   }
 }
 
-#define INFO_N 10
+#define INFO_N 13
 static void infoItem(int i, char *l, char *v) {
   bool c = (cs == CS_CONNECTED);
   uint32_t s = millis() / 1000;
@@ -991,18 +1107,31 @@ static void infoItem(int i, char *l, char *v) {
       if (c) snprintf(v, 24, "ch %d  %d dBm", (int)WiFi.channel(), (int)WiFi.RSSI()); else strcpy(v, "-");
       break;
     case 4:
+      strcpy(l, "Internet");
+      if (!c || !inetKnown) strcpy(v, "-");
+      else if (!inetOk) strcpy(v, "No internet");
+      else if (!dnsOk) strcpy(v, "DNS problem");
+      else snprintf(v, 24, "Online  %u ms", (unsigned)pingMs);
+      break;
+    case 5: snprintf(l, 24, "DNS (%s)", DNS_NAME[cfg.dnsMode]); strlcpy(v, dnsEffective().toString().c_str(), 24); break;
+    case 6:
+      strcpy(l, "Last speed test");
+      if (speedState == 2) snprintf(v, 24, "%u.%u Mbps", (unsigned)(speedKbps / 1000), (unsigned)((speedKbps % 1000) / 100));
+      else strcpy(v, "Not run");
+      break;
+    case 7:
       strcpy(l, "Battery");
       if (batPresent) snprintf(v, 24, "%u.%02u V  %u%%", (unsigned)(batMv / 1000), (unsigned)((batMv % 1000) / 10), (unsigned)batPct);
       else strcpy(v, "Not detected");
       break;
-    case 5: strcpy(l, "AP MAC"); strlcpy(v, WiFi.softAPmacAddress().c_str(), 24); break;
-    case 6: strcpy(l, "Free memory"); snprintf(v, 24, "%u.%u KB", (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)((ESP.getFreeHeap() % 1024) * 10 / 1024)); break;
-    case 7:
+    case 8: strcpy(l, "AP MAC"); strlcpy(v, WiFi.softAPmacAddress().c_str(), 24); break;
+    case 9: strcpy(l, "Free memory"); snprintf(v, 24, "%u.%u KB", (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)((ESP.getFreeHeap() % 1024) * 10 / 1024)); break;
+    case 10:
       strcpy(l, "Uptime");
       if (s >= 86400) snprintf(v, 24, "%ud %02uh %02um", (unsigned)(s / 86400), (unsigned)((s / 3600) % 24), (unsigned)((s / 60) % 60));
       else snprintf(v, 24, "%02u:%02u:%02u", (unsigned)(s / 3600), (unsigned)((s / 60) % 60), (unsigned)(s % 60));
       break;
-    case 8: strcpy(l, "AP security"); strcpy(v, apIsOpen ? "Open (setup)" : "Password"); break;
+    case 11: strcpy(l, "AP security"); strcpy(v, apIsOpen ? "Open (setup)" : "Password"); break;
     default: strcpy(l, "Firmware"); strlcpy(v, FW_VERSION, 24); break;
   }
 }
@@ -1026,13 +1155,19 @@ static void drawInfo() {
 static void drawConfirm() {
   oled->drawFrame(6, 8, 116, 50);
   oled->setFont(F_UI);
-  const char *q = confirmKind == CF_FORGET ? "Forget network?" : "Restart device?";
-  oled->drawStr((128 - oled->getStrWidth(q)) / 2, 24, q);
-  if (confirmKind == CF_FORGET) {
+  const char *a = "No", *b = "Yes";
+  if (confirmKind == CF_RESTART) {
+    const char *q = "Restart device?";
+    oled->drawStr((128 - oled->getStrWidth(q)) / 2, 24, q);
+  } else {
     char buf[40];
+    a = "Join";
+    b = "Forget";
+    fit(cfg.saved[confirmIdx].ssid, buf, sizeof(buf), 104);
+    oled->drawStr((128 - oled->getStrWidth(buf)) / 2, 24, buf);
     oled->setFont(F_SM);
-    fit(cfg.staSsid, buf, sizeof(buf), 100);
-    oled->drawStr((128 - oled->getStrWidth(buf)) / 2, 33, buf);
+    const char *sub = "Saved network";
+    oled->drawStr((128 - oled->getStrWidth(sub)) / 2, 33, sub);
   }
   for (int k = 0; k < 2; k++) {
     int x = k == 0 ? 18 : 70;
@@ -1040,9 +1175,71 @@ static void drawConfirm() {
     if (sel) { oled->drawBox(x, 38, 40, 14); oled->setDrawColor(0); }
     else oled->drawFrame(x, 38, 40, 14);
     oled->setFont(F_UI);
-    const char *t = k == 0 ? "No" : "Yes";
+    const char *t = k == 0 ? a : b;
     oled->drawStr(x + (40 - oled->getStrWidth(t)) / 2, 49, t);
     oled->setDrawColor(1);
+  }
+}
+
+static void drawSaved() {
+  header("Saved");
+  int n = savedN();
+  if (n == 0) {
+    oled->setFont(F_UI);
+    oled->drawStr(14, 36, "No saved networks");
+    oled->setFont(F_SM);
+    oled->drawStr(12, 48, "Join one from Networks");
+    return;
+  }
+  for (int r = 0; r < 4; r++) {
+    int i = savedL.top + r;
+    if (i >= n) break;
+    int y = 14 + r * 12;
+    rowBegin(y, i == savedL.sel);
+    bool cur = (cs == CS_CONNECTED && !strcmp(cfg.saved[i].ssid, connectedSsid));
+    if (cur) drawTick(2, y + 3);
+    else oled->drawXBMP(2, y + 2, 8, 8, IC_STAR);
+    char buf[40];
+    oled->setFont(F_UI);
+    fit(cfg.saved[i].ssid, buf, sizeof(buf), 100);
+    oled->drawStr(13, y + 10, buf);
+    oled->setDrawColor(1);
+  }
+  scrollbar(n, savedL.top, 4);
+}
+
+static void drawSpeed() {
+  header("Speed test");
+  char b[24];
+  if (speedState == 1 || speedState == 2) {
+    uint32_t k = speedState == 1 ? speedLiveKbps : speedKbps;
+    snprintf(b, sizeof(b), "%u.%u", (unsigned)(k / 1000), (unsigned)((k % 1000) / 100));
+    oled->setFont(F_BIG);
+    int w = oled->getStrWidth(b);
+    oled->drawStr(4, 31, b);
+    oled->setFont(F_SM);
+    oled->drawStr(8 + w, 31, "Mbps down");
+    if (speedState == 1) {
+      oled->drawFrame(4, 38, 120, 7);
+      oled->drawBox(6, 40, (116 * speedPct) / 100, 3);
+      oled->drawStr(4, 61, "Measuring download...");
+    } else {
+      snprintf(b, sizeof(b), "Ping %u ms   DNS %u ms", (unsigned)pingMs, (unsigned)dnsMs);
+      oled->drawStr(4, 46, b);
+      oled->drawStr(4, 61, "OK to run again");
+    }
+  } else if (speedState == 3) {
+    oled->setFont(F_UI);
+    oled->drawStr(4, 30, "Test failed");
+    oled->setFont(F_SM);
+    oled->drawStr(4, 42, speedMsg);
+    oled->drawStr(4, 61, "OK to retry");
+  } else {
+    oled->setFont(F_UI);
+    oled->drawStr(4, 30, "Download speed");
+    oled->setFont(F_SM);
+    oled->drawStr(4, 42, "Uses up to about 6 MB");
+    oled->drawStr(4, 61, "OK to start");
   }
 }
 
@@ -1071,7 +1268,7 @@ static void uiDraw() {
   uint32_t now = millis();
   bool anim = (screen == SC_CONNECT && cs == CS_CONNECTING) || screen == SC_KEYS || (screen == SC_NETS && scanning) ||
               (screen == SC_HOME && (cs == CS_CONNECTING || (cs == CS_CONNECTED && cfg.repeater))) ||
-              (screen == SC_LED && cfg.ledMode != 0);
+              (screen == SC_LED && cfg.ledMode != 0) || (screen == SC_SPEED && speedState == 1);
   if (!dirty && now - lastDraw < (anim ? 90u : 400u)) return;
   dirty = false;
   lastDraw = now;
@@ -1087,6 +1284,8 @@ static void uiDraw() {
     case SC_DISPLAY: drawDisplay(); break;
     case SC_LED:     drawLed(); break;
     case SC_INFO:    drawInfo(); break;
+    case SC_SAVED:   drawSaved(); break;
+    case SC_SPEED:   drawSpeed(); break;
     case SC_CONFIRM: drawConfirm(); break;
     case SC_MESSAGE: drawMessage(); break;
   }
@@ -1154,19 +1353,31 @@ static void kbPress() {
 }
 
 static void doConfirm() {
-  if (confirmKind == CF_FORGET) {
-    cfg.staSsid[0] = 0;
-    cfg.staPass[0] = 0;
-    cfgSave();
-    WiFi.disconnect();
-    cs = CS_IDLE;
-    pendSsid[0] = 0;
-    goHome();
-    toast("Network forgotten");
+  if (confirmKind == CF_SAVED) {
+    if (confirmIdx < 0 || confirmIdx >= MAX_SAVED || !cfg.saved[confirmIdx].ssid[0]) { screen = SC_SAVED; return; }
+    if (confirmYes) {
+      savedRemove(confirmIdx);
+      cfgSave();
+      savedL.sel = 0;
+      savedL.top = 0;
+      screen = SC_SAVED;
+      toast("Network forgotten");
+    } else {
+      staConnect(cfg.saved[confirmIdx].ssid, cfg.saved[confirmIdx].pass, false);
+      screen = SC_CONNECT;
+    }
   } else {
     showMessage("Restarting", "Please wait");
     rebootAt = millis() + 700;
   }
+}
+
+static void dnsCycle(int d) {
+  int n = customSet() ? 6 : 5;
+  cfg.dnsMode = (uint8_t)((cfg.dnsMode + d + n) % n);
+  cfgSave();
+  applyDns();
+  dirty = true;
 }
 
 static void leaveSettings(Screen to) {
@@ -1201,19 +1412,21 @@ static void uiHandle() {
     case SC_MENU:
       if (P(B_UP)) listNav(menuL, MENU_N, -1, 4);
       if (P(B_DOWN)) listNav(menuL, MENU_N, 1, 4);
-      if ((P(B_LEFT) || P(B_RIGHT)) && menuL.sel == 1) setRepeater(!cfg.repeater);
+      if (P(B_LEFT) || P(B_RIGHT)) {
+        if (menuL.sel == 2) setRepeater(!cfg.repeater);
+        else if (menuL.sel == 3) dnsCycle(P(B_RIGHT) ? 1 : -1);
+      }
       if (P(B_BACK)) goHome();
       if (P(B_OK)) {
         switch (menuL.sel) {
           case 0: openNets(); break;
-          case 1: setRepeater(!cfg.repeater); break;
-          case 2: screen = SC_DISPLAY; dispL.sel = 0; dispL.top = 0; break;
-          case 3: screen = SC_LED; ledL.sel = 0; ledL.top = 0; break;
-          case 4: screen = SC_INFO; infoL.sel = 0; infoL.top = 0; break;
-          case 5:
-            if (!cfg.staSsid[0]) toast("No saved network");
-            else { confirmKind = CF_FORGET; confirmYes = false; screen = SC_CONFIRM; }
-            break;
+          case 1: screen = SC_SAVED; savedL.sel = 0; savedL.top = 0; break;
+          case 2: setRepeater(!cfg.repeater); break;
+          case 3: dnsCycle(1); break;
+          case 4: screen = SC_DISPLAY; dispL.sel = 0; dispL.top = 0; break;
+          case 5: screen = SC_LED; ledL.sel = 0; ledL.top = 0; break;
+          case 6: screen = SC_SPEED; break;
+          case 7: screen = SC_INFO; infoL.sel = 0; infoL.top = 0; break;
           default: confirmKind = CF_RESTART; confirmYes = false; screen = SC_CONFIRM; break;
         }
       }
@@ -1226,8 +1439,12 @@ static void uiHandle() {
       if (P(B_BACK)) screen = SC_MENU;
       if (P(B_OK)) {
         if (netL.sel >= netCount) startScan();
-        else if (nets[netL.sel].enc) kbOpen(nets[netL.sel].ssid);
-        else { staConnect(nets[netL.sel].ssid, "", true); screen = SC_CONNECT; }
+        else {
+          int si = savedFind(nets[netL.sel].ssid);
+          if (si >= 0) { staConnect(cfg.saved[si].ssid, cfg.saved[si].pass, false); screen = SC_CONNECT; }
+          else if (nets[netL.sel].enc) kbOpen(nets[netL.sel].ssid);
+          else { staConnect(nets[netL.sel].ssid, "", true); screen = SC_CONNECT; }
+        }
       }
       break;
     }
@@ -1249,7 +1466,7 @@ static void uiHandle() {
         if (P(B_BACK)) { cancelConnect(); screen = SC_NETS; }
       } else if (cs == CS_FAILED) {
         if (P(B_OK)) {
-          if (pendPass[0]) screen = SC_KEYS;
+          if (pendPass[0]) kbOpen(pendSsid);
           else staConnect(pendSsid, "", true);
         }
         if (P(B_BACK)) screen = SC_NETS;
@@ -1290,6 +1507,20 @@ static void uiHandle() {
       if (P(B_BACK)) leaveSettings(SC_MENU);
       break;
 
+    case SC_SAVED: {
+      int n = savedN();
+      if (P(B_UP)) listNav(savedL, n, -1, 4);
+      if (P(B_DOWN)) listNav(savedL, n, 1, 4);
+      if (P(B_BACK)) screen = SC_MENU;
+      if (P(B_OK) && n > 0) { confirmKind = CF_SAVED; confirmIdx = savedL.sel; confirmYes = false; screen = SC_CONFIRM; }
+      break;
+    }
+
+    case SC_SPEED:
+      if (P(B_BACK)) screen = SC_MENU;
+      if (P(B_OK)) { if (cs == CS_CONNECTED) speedPending = true; else toast("Not connected"); }
+      break;
+
     case SC_INFO:
       if (P(B_UP) && infoL.top > 0) infoL.top--;
       if (P(B_DOWN) && infoL.top < INFO_N - 3) infoL.top++;
@@ -1298,8 +1529,8 @@ static void uiHandle() {
 
     case SC_CONFIRM:
       if (P(B_LEFT) || P(B_RIGHT) || P(B_UP) || P(B_DOWN)) confirmYes = !confirmYes;
-      if (P(B_BACK)) screen = SC_MENU;
-      if (P(B_OK)) { if (confirmYes) doConfirm(); else screen = SC_MENU; }
+      if (P(B_BACK)) screen = (confirmKind == CF_SAVED) ? SC_SAVED : SC_MENU;
+      if (P(B_OK)) { if (confirmKind == CF_SAVED || confirmYes) doConfirm(); else screen = SC_MENU; }
       break;
 
     default: break;
@@ -1367,27 +1598,32 @@ static const char *csName() {
 static void hStatus() {
   if (!guard()) return;
   bool c = (cs == CS_CONNECTED);
-  const char *shown = c ? connectedSsid : ((cs != CS_IDLE && pendSsid[0]) ? pendSsid : cfg.staSsid);
+  const char *shown = c ? connectedSsid : ((cs != CS_IDLE && pendSsid[0]) ? pendSsid : cfg.saved[0].ssid);
   const char *ledLab = "LED off";
   ledCurrent(&ledLab);
   String o;
-  o.reserve(760);
+  o.reserve(1100);
   o += '{';
   jStr(o, "fw", FW_VERSION); o += ',';
   jStr(o, "state", csName()); o += ',';
   jStr(o, "reason", failReason); o += ',';
   jStr(o, "ssid", shown); o += ',';
-  jStr(o, "saved", cfg.staSsid); o += ',';
   jStr(o, "ip", c ? WiFi.localIP().toString().c_str() : ""); o += ',';
   jStr(o, "gw", c ? WiFi.gatewayIP().toString().c_str() : ""); o += ',';
   jStr(o, "apSsid", cfg.apSsid); o += ',';
   jStr(o, "apIp", WiFi.softAPIP().toString().c_str()); o += ',';
-  jStr(o, "led", ledLab);
+  jStr(o, "led", ledLab); o += ','; jStr(o, "dnsName", DNS_NAME[cfg.dnsMode]); o += ','; jStr(o, "dnsIp", dnsEffective().toString().c_str());
   o += ",\"rssi\":"; o += c ? WiFi.RSSI() : 0;
   o += ",\"channel\":"; o += c ? WiFi.channel() : 0;
   o += ",\"clients\":"; o += (int)WiFi.softAPgetStationNum();
   o += ",\"repeater\":"; o += cfg.repeater ? "true" : "false";
   o += ",\"apOpen\":"; o += apIsOpen ? "true" : "false";
+  o += ",\"savedCount\":"; o += savedN();
+  o += ",\"inet\":\""; o += (!c || !inetKnown) ? "unknown" : (!inetOk ? "offline" : (dnsOk ? "online" : "nodns")); o += '"';
+  o += ",\"ping\":"; o += (int)pingMs;
+  o += ",\"dnsMs\":"; o += (int)dnsMs;
+  o += ",\"speedState\":"; o += (int)speedState;
+  o += ",\"speedKbps\":"; o += (uint32_t)speedKbps;
   o += ",\"batPresent\":"; o += batPresent ? "true" : "false";
   o += ",\"batMv\":"; o += (int)batMv;
   o += ",\"batPct\":"; o += (int)batPct;
@@ -1464,6 +1700,8 @@ static void hConnect() {
   if (!guard()) return;
   String s = server.arg("ssid"), p = server.arg("pass");
   if (s.length() < 1 || s.length() > 32) { sendErr("Network name must be 1-32 characters"); return; }
+  int si = savedFind(s.c_str());
+  if (!p.length() && si >= 0) p = cfg.saved[si].pass;  // use the stored password
   if (p.length() && (p.length() < 8 || p.length() > 63)) { sendErr("Password must be 8-63 characters"); return; }
   staConnect(s.c_str(), p.c_str(), true);
   sendJson("{\"ok\":true}");
@@ -1471,13 +1709,41 @@ static void hConnect() {
 
 static void hForget() {
   if (!guard()) return;
-  cfg.staSsid[0] = 0;
-  cfg.staPass[0] = 0;
+  if (server.arg("all") == "1") {
+    memset(cfg.saved, 0, sizeof(cfg.saved));
+  } else {
+    int i = savedFind(server.arg("ssid").c_str());
+    if (i < 0) { sendErr("Not a saved network"); return; }
+    savedRemove(i);
+  }
   cfgSave();
-  WiFi.disconnect();
-  cs = CS_IDLE;
-  pendSsid[0] = 0;
   dirty = true;
+  sendJson("{\"ok\":true}");
+}
+
+static void hSaved() {
+  if (!guard()) return;
+  String o;
+  o.reserve(400);
+  o += "{\"list\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_SAVED; i++) {
+    if (!cfg.saved[i].ssid[0]) continue;
+    if (!first) o += ',';
+    first = false;
+    o += '{';
+    jStr(o, "ssid", cfg.saved[i].ssid);
+    o += ",\"current\":"; o += (cs == CS_CONNECTED && !strcmp(cfg.saved[i].ssid, connectedSsid)) ? "true" : "false";
+    o += '}';
+  }
+  o += "]}";
+  sendJson(o);
+}
+
+static void hSpeed() {
+  if (!guard()) return;
+  if (cs != CS_CONNECTED) { sendErr("Not connected to an upstream network"); return; }
+  if (speedState != 1) speedPending = true;
   sendJson("{\"ok\":true}");
 }
 
@@ -1499,7 +1765,7 @@ static const char *const PIN_ARGS[P_COUNT] = {"pUp", "pDown", "pLeft", "pRight",
 static void hCfgGet() {
   if (!guard()) return;
   String o;
-  o.reserve(520);
+  o.reserve(700);
   o += '{';
   jStr(o, "apSsid", cfg.apSsid); o += ',';
   jStr(o, "apPass", cfg.apPass);
@@ -1513,6 +1779,8 @@ static void hCfgGet() {
   o += ",\"ledBright\":"; o += (int)cfg.ledBright;
   o += ",\"ledCount\":"; o += (int)cfg.ledCount;
   o += ",\"adcFullMv\":"; o += (int)cfg.adcFullMv;
+  o += ",\"dnsMode\":"; o += (int)cfg.dnsMode;
+  o += ','; jStr(o, "dnsCustom", IPAddress(cfg.dnsCustom[0], cfg.dnsCustom[1], cfg.dnsCustom[2], cfg.dnsCustom[3]).toString().c_str());
   o += ",\"pins\":{";
   for (int i = 0; i < P_COUNT; i++) {
     if (i) o += ',';
@@ -1526,7 +1794,7 @@ static void hCfgPost() {
   if (!guard()) return;
   Config n = cfg;
   const char *err = nullptr;
-  bool apCh = false, pinsCh = false, ledCh = false;
+  bool apCh = false, pinsCh = false, ledCh = false, dnsCh = false;
 
   if (server.hasArg("apSsid")) {
     String s = server.arg("apSsid");
@@ -1574,6 +1842,19 @@ static void hCfgPost() {
     if (c < 1 || c > 8) err = "LED count must be 1-8";
     else if (c != n.ledCount) { n.ledCount = c; ledCh = true; }
   }
+  if (!err && server.hasArg("dnsMode")) {
+    int m = server.arg("dnsMode").toInt();
+    if (m < 0 || m > 5) err = "Unknown DNS option";
+    else if (m != n.dnsMode) { n.dnsMode = m; dnsCh = true; }
+  }
+  if (!err && server.hasArg("dnsCustom")) {
+    String d = server.arg("dnsCustom");
+    IPAddress ip;
+    if (d.length() == 0) { if (n.dnsCustom[0] || n.dnsCustom[1] || n.dnsCustom[2] || n.dnsCustom[3]) dnsCh = true; memset(n.dnsCustom, 0, 4); }
+    else if (!ip.fromString(d)) err = "Custom DNS must be an IPv4 address";
+    else { for (int k = 0; k < 4; k++) n.dnsCustom[k] = ip[k]; dnsCh = true; }
+  }
+  if (!err && n.dnsMode == 5 && !(n.dnsCustom[0] || n.dnsCustom[1] || n.dnsCustom[2] || n.dnsCustom[3])) err = "Enter a custom DNS address";
   if (!err && server.hasArg("adcFullMv")) {
     int v = server.arg("adcFullMv").toInt();
     if (v < 1000 || v > 20000) err = "Full-scale voltage must be 1000-20000 mV";
@@ -1592,6 +1873,7 @@ static void hCfgPost() {
 
   cfg = n;
   cfgSave();
+  if (dnsCh) { applyDns(); inetNext = millis() + 1000; }
   applyBrightness();
   if (oled) oled->setFlipMode(cfg.flip ? 1 : 0);
   if (ledCh && !pinsCh) ledInit();
@@ -1633,6 +1915,8 @@ static void webInit() {
   server.on("/api/scan", HTTP_POST, hScan);
   server.on("/api/connect", HTTP_POST, hConnect);
   server.on("/api/forget", HTTP_POST, hForget);
+  server.on("/api/saved", HTTP_GET, hSaved);
+  server.on("/api/speedtest", HTTP_POST, hSpeed);
   server.on("/api/repeater", HTTP_POST, hRepeater);
   server.on("/api/battery/cal", HTTP_POST, hBatCal);
   server.on("/api/config", HTTP_GET, hCfgGet);
@@ -1641,6 +1925,125 @@ static void webInit() {
   server.on("/api/factory", HTTP_POST, hFactory);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
+}
+
+// ===================================================================
+//  Internet check and speed test
+// ===================================================================
+static bool dnsQuery(IPAddress srv, uint16_t &ms) {
+  WiFiUDP u;
+  if (!u.begin(40000 + (micros() % 2000))) return false;
+  static const uint8_t q[] = {0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0,
+                              7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
+  uint32_t t = millis();
+  u.beginPacket(srv, 53);
+  u.write(q, sizeof(q));
+  u.endPacket();
+  while (millis() - t < 1500) {
+    int n = u.parsePacket();
+    if (n >= 12) {
+      uint8_t r[12];
+      u.read(r, 12);
+      u.stop();
+      ms = (uint16_t)(millis() - t);
+      return r[0] == 0x12 && r[1] == 0x34 && (r[2] & 0x80) && ((r[3] & 0x0F) == 0) && (r[6] | r[7]);
+    }
+    delay(1);
+  }
+  u.stop();
+  return false;
+}
+
+static void inetProbe() {
+  WiFiClient c;
+  uint32_t t = millis();
+  bool ok = c.connect(IPAddress(1, 1, 1, 1), 443, 1200);
+  uint32_t ping = millis() - t;
+  c.stop();
+  if (!ok) {
+    t = millis();
+    ok = c.connect(IPAddress(8, 8, 8, 8), 443, 1200);
+    ping = millis() - t;
+    c.stop();
+  }
+  uint16_t dm = 0;
+  dnsOk = dnsQuery(dnsEffective(), dm);
+  dnsMs = dnsOk ? dm : 0;
+  inetOk = ok || dnsOk;
+  pingMs = ok ? (uint16_t)(ping > 999 ? 999 : ping) : dnsMs;
+  inetKnown = true;
+  dirty = true;
+}
+
+static const char *const SPEED_HOST[2] = {"speedtest.tele2.net", "ipv4.download.thinkbroadband.com"};
+
+static bool speedTry(const char *host, uint32_t &kbps) {
+  IPAddress ip;
+  if (!WiFi.hostByName(host, ip, 3000)) { strlcpy(speedMsg, "DNS lookup failed", sizeof(speedMsg)); return false; }
+  WiFiClient c;
+  if (!c.connect(ip, 80, 3000)) { strlcpy(speedMsg, "No connection", sizeof(speedMsg)); return false; }
+  c.print(String("GET /10MB.zip HTTP/1.0\r\nHost: ") + host + "\r\nConnection: close\r\nUser-Agent: repeater\r\n\r\n");
+
+  char first[16] = {0};
+  int fi = 0, st = 0;
+  bool hdr = false;
+  uint32_t deadline = millis() + 5000;
+  while (!hdr && millis() < deadline) {
+    if (!c.available()) { if (!c.connected()) break; delay(1); continue; }
+    char ch = c.read();
+    if (fi < 12) first[fi++] = ch;
+    if (ch == '\r' && (st == 0 || st == 2)) st++;
+    else if (ch == '\n' && (st == 1 || st == 3)) { st++; if (st == 4) hdr = true; }
+    else st = 0;
+  }
+  if (!hdr || !strstr(first, " 200")) { c.stop(); strlcpy(speedMsg, "Server error", sizeof(speedMsg)); return false; }
+
+  static uint8_t buf[1024];
+  uint32_t bytes = 0, t0 = millis(), lastUi = t0, lastData = t0;
+  while ((c.connected() || c.available()) && millis() - t0 < 6000 && bytes < 10000000UL) {
+    int n = c.available();
+    uint32_t now = millis();
+    if (n <= 0) {
+      if (now - lastData > 3000) break;
+      delay(1);
+      continue;
+    }
+    if (n > (int)sizeof(buf)) n = sizeof(buf);
+    n = c.read(buf, n);
+    if (n > 0) { bytes += n; lastData = now; }
+    if (now - lastUi > 300) {
+      lastUi = now;
+      uint32_t el = now - t0;
+      if (el > 0) speedLiveKbps = (uint32_t)((uint64_t)bytes * 8 / el);
+      speedPct = (uint8_t)(el * 100 / 6000 > 100 ? 100 : el * 100 / 6000);
+      dirty = true;
+      server.handleClient();
+      uiDraw();
+    }
+    yield();
+  }
+  c.stop();
+  uint32_t ms = millis() - t0;
+  if (ms < 300 || bytes < 20000) { strlcpy(speedMsg, "Too little data", sizeof(speedMsg)); return false; }
+  kbps = (uint32_t)((uint64_t)bytes * 8 / ms);
+  return true;
+}
+
+static void speedRun() {
+  speedPending = false;
+  speedState = 1;
+  speedLiveKbps = 0;
+  speedPct = 0;
+  speedMsg[0] = 0;
+  dirty = true;
+  uiDraw();
+  uint32_t k = 0;
+  bool ok = false;
+  for (int i = 0; i < 2 && !ok; i++) ok = speedTry(SPEED_HOST[i], k);
+  if (ok) { speedKbps = k; speedState = 2; }
+  else speedState = 3;
+  inetNext = millis() + 5000;
+  dirty = true;
 }
 
 // ===================================================================
@@ -1665,7 +2068,6 @@ void setup() {
   ip_napt_enable_no(SOFTAP_IF, cfg.repeater);
 
   webInit();
-  if (cfg.staSsid[0]) staConnect(cfg.staSsid, cfg.staPass, false);
 }
 
 void loop() {
@@ -1680,6 +2082,13 @@ void loop() {
   uiDraw();
 
   uint32_t now = millis();
+  if (speedPending) {
+    if (cs == CS_CONNECTED) speedRun();
+    else { speedPending = false; speedState = 3; strlcpy(speedMsg, "Not connected", sizeof(speedMsg)); }
+  } else if (cs == CS_CONNECTED && (int32_t)(now - inetNext) >= 0 && now - lastActivity > 2500 && screen != SC_KEYS) {
+    inetProbe();
+    inetNext = millis() + ((inetOk && dnsOk) ? 30000 : 10000);
+  }
   static uint32_t apChk = 0;
   if (now - apChk > 1000) {
     apChk = now;

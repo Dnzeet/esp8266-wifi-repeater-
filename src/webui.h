@@ -9,6 +9,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 :root{color-scheme:light dark;--bg:#d6dad4;--panel:#e9ece6;--field:#f5f6f2;--ink:#151815;--mute:#59615a;--line:#b5bbb3;--btn:#151815;--btn-ink:#f2f4ef;--ok:#2b7a4b;--warn:#a9680f;--bad:#b3261e;--scr:#05080b}
 @media(prefers-color-scheme:dark){:root{--bg:#171b18;--panel:#212722;--field:#171b18;--ink:#e9ede7;--mute:#97a199;--line:#38413a;--btn:#e9ede7;--btn-ink:#151815;--ok:#6fd49b;--warn:#e7b25a;--bad:#ff8a80}}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;font-variant-numeric:tabular-nums}
 .wrap{max-width:560px;margin:0 auto;padding:0 16px 72px}
@@ -93,6 +94,7 @@ p.hint{margin:8px 0 0;font-size:13px;color:var(--mute)}
 </div>
 <ul class="group"><li class="gr"><div>Repeater<small>Forward traffic between the upstream network and the access point</small></div>
 <label class="sw"><input type="checkbox" id="rep" aria-label="Repeater"><span></span></label></li></ul>
+<ul class="group" style="margin-top:8px"><li class="gr"><div>Internet<small id="inetTxt">Checking...</small></div><button class="btn" id="speedBtn">Speed test</button></li></ul>
 <h2>Signal, last 3 minutes</h2>
 <div class="chart"><canvas id="hist"></canvas></div>
 <h2>Connected devices</h2>
@@ -102,14 +104,14 @@ p.hint{margin:8px 0 0;font-size:13px;color:var(--mute)}
 </section>
 
 <section id="conn">
-<div class="row between"><h2 style="margin:0">Nearby networks</h2><button class="btn" id="scan">Scan</button></div>
+<h2>Saved networks</h2>
+<ul class="group list" id="saved"><li class="empty">None yet. Networks you join are remembered here.</li></ul>
+<div class="row between" style="margin-top:30px"><h2 style="margin:0">Nearby networks</h2><button class="btn" id="scan">Scan</button></div>
 <ul class="group list" id="nets" style="margin-top:12px"><li class="empty">Press Scan to look for networks.</li></ul>
 <h2>Join a network</h2>
 <label>Network name<input id="ssid" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
 <label>Password<div class="inp"><input id="pass" type="password" maxlength="63" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Leave empty for an open network"><button type="button" class="btn" id="eye">Show</button></div></label>
 <div class="row"><button class="btn pri" id="join">Connect</button><span id="cmsg" class="hint" style="margin:0"></span></div>
-<h2>Saved network</h2>
-<ul class="group"><li class="gr"><span id="sv">None</span><button class="btn dan" id="forget" hidden>Forget</button></li></ul>
 </section>
 
 <section id="ap">
@@ -117,6 +119,9 @@ p.hint{margin:8px 0 0;font-size:13px;color:var(--mute)}
 <label>Password<input id="apPass" maxlength="63" autocomplete="off" autocapitalize="none" spellcheck="false">
 <p class="hint">8 to 63 characters. Leave empty to make the network open.</p></label>
 <label>Maximum clients<select id="maxc"></select></label>
+<label>DNS for connected devices<select id="dnsMode"><option value="0">Same as upstream (auto)</option><option value="1">Cloudflare 1.1.1.1</option><option value="2">Google 8.8.8.8</option><option value="3">Quad9 9.9.9.9</option><option value="4">AdGuard 94.140.14.14 (blocks ads)</option><option value="5">Custom</option></select>
+<p class="hint">Devices pick up a changed DNS when they reconnect or renew their address.</p></label>
+<label id="dnsCustomWrap" hidden>Custom DNS address<input id="dnsCustom" inputmode="decimal" placeholder="e.g. 192.168.0.2" autocomplete="off" spellcheck="false"></label>
 <label class="chk"><input type="checkbox" id="apHidden">Hide network name</label>
 <label class="chk" style="margin-top:12px"><input type="checkbox" id="apSetupOpen">Keep the access point open until connected</label>
 <p class="hint">While there is no upstream connection (at startup, or after the link is lost for a while) the access point has no password so you can reach this page. Once connected it switches to the password above and nearby clients must reconnect.</p>
@@ -170,7 +175,7 @@ const qual=r=>r>=-55?'Excellent':r>=-65?'Good':r>=-75?'Fair':'Weak';
 
 $$('nav button').forEach(b=>b.onclick=()=>{$$('nav button').forEach(x=>x.classList.toggle('on',x===b));
 $$('section').forEach(s=>s.classList.toggle('on',s.id===b.dataset.t));
-if(b.dataset.t==='ap'||b.dataset.t==='dev')loadCfg();if(b.dataset.t==='over'){mirror();drawHist()}});
+if(b.dataset.t==='ap'||b.dataset.t==='dev')loadCfg();if(b.dataset.t==='conn')loadSaved();if(b.dataset.t==='over'){mirror();drawHist()}});
 
 /* dot-matrix readouts, same 5x7 grid as the OLED */
 const G={'0':[62,81,73,69,62],'1':[0,66,127,64,0],'2':[66,97,81,73,70],'3':[33,65,69,75,49],'4':[24,20,18,127,16],'5':[39,69,69,69,57],'6':[60,74,73,73,48],'7':[1,113,9,5,3],'8':[54,73,73,73,54],'9':[6,73,73,41,30],
@@ -208,10 +213,13 @@ dots($('#v_sig'),c?String(s.rssi):'--',4);$('#s_sig').textContent=c?'dBm, '+qual
 dots($('#v_bat'),s.batPresent?s.batPct+'%':'USB',4);$('#s_bat').textContent=s.batPresent?(s.batMv/1000).toFixed(2)+' V':'No battery';
 dots($('#v_cli'),String(s.clients),4);$('#s_cli').textContent=s.repeater?'Repeater on':'Repeater off';
 hist.push(c?s.rssi:null);if(hist.length>HN)hist.shift();drawHist();
-const kv=[['Upstream network',s.ssid||'None'],['Upstream address',c?s.ip:'-'],['Gateway',c?s.gw:'-'],['Access point',s.apSsid+(s.apOpen?' (open, setup mode)':'')],['Web UI address',s.apIp],['Free memory',(s.heap/1024).toFixed(1)+' KB'],['Uptime',upt(s.uptime)]];
+const kv=[['Upstream network',s.ssid||'None'],['Upstream address',c?s.ip:'-'],['Gateway',c?s.gw:'-'],['DNS for devices',s.dnsName+', '+s.dnsIp],['Access point',s.apSsid+(s.apOpen?' (open, setup mode)':'')],['Web UI address',s.apIp],['Free memory',(s.heap/1024).toFixed(1)+' KB'],['Uptime',upt(s.uptime)]];
 $('#kv').innerHTML=kv.map(r=>'<dt>'+r[0]+'</dt><dd>'+esc(r[1])+'</dd>').join('');
-$('#sv').textContent=s.saved||'None';$('#forget').hidden=!s.saved;$('#ver').textContent='Firmware '+s.fw;
+$('#ver').textContent='Firmware '+s.fw;
 $('#ledNow').textContent='Showing now: '+s.led;
+const it=s.inet==='online'?'Online, '+s.ping+' ms, DNS '+s.dnsMs+' ms':s.inet==='nodns'?'Reachable, but DNS is not answering':s.inet==='offline'?'No internet':c?'Checking...':'Not connected';
+const sp=s.speedState===1?' | Testing...':s.speedState===2?' | '+(s.speedKbps/1000).toFixed(1)+' Mbps down':s.speedState===3?' | Speed test failed':'';
+$('#inetTxt').textContent=it+sp;$('#speedBtn').disabled=!c||s.speedState===1;
 $('#batRead').textContent=s.batPresent?(s.batMv/1000).toFixed(2)+' V, '+s.batPct+'%, raw '+s.adcRaw:'No battery detected, raw '+s.adcRaw;
 if($('#over').classList.contains('on')){const k=await api('/api/clients');
 $('#cl').innerHTML=k.list.length?k.list.map(d=>'<li class="gr"><span>'+esc(d.ip)+'</span><span class="mono">'+esc(d.mac)+'</span></li>').join(''):'<li class="gr"><span class="mono">No devices connected</span></li>'}
@@ -221,8 +229,8 @@ $('#cl').innerHTML=k.list.length?k.list.map(d=>'<li class="gr"><span>'+esc(d.ip)
 let nets=[],busy=false;
 function drawNets(){const ul=$('#nets');
 if(!nets.length){ul.innerHTML='<li class="empty">No networks found. Try scanning again.</li>';return}
-ul.innerHTML=nets.map((n,i)=>'<li data-i="'+i+'"><span class="name">'+esc(n.ssid)+'</span><span class="meta">'+(n.enc?'Secured':'Open')+'<span>'+n.rssi+' dBm</span>'+bars(n.rssi)+'</span></li>').join('');
-$$('#nets li[data-i]').forEach(li=>li.onclick=()=>{const n=nets[li.dataset.i];$('#ssid').value=n.ssid;$('#pass').value='';(n.enc?$('#pass'):$('#join')).focus()})}
+ul.innerHTML=nets.map((n,i)=>'<li data-i="'+i+'"><span class="name">'+esc(n.ssid)+'</span><span class="meta">'+(savedSet.has(n.ssid)?'Saved':(n.enc?'Secured':'Open'))+'<span>'+n.rssi+' dBm</span>'+bars(n.rssi)+'</span></li>').join('');
+$$('#nets li[data-i]').forEach(li=>li.onclick=()=>{const n=nets[li.dataset.i];$('#ssid').value=n.ssid;$('#pass').value='';$('#pass').placeholder=savedSet.has(n.ssid)?'Saved password will be used':'Leave empty for an open network';(n.enc&&!savedSet.has(n.ssid)?$('#pass'):$('#join')).focus()})}
 async function scan(){if(busy)return;busy=true;$('#scan').disabled=true;$('#nets').innerHTML='<li class="empty">Scanning...</li>';
 try{await api('/api/scan',{});for(let i=0;i<25;i++){await sleep(900);const j=await api('/api/networks');if(!j.scanning){nets=j.list;break}}}catch(e){toast(e.message,1)}
 busy=false;$('#scan').disabled=false;drawNets()}
@@ -233,8 +241,16 @@ if(!ssid)return toast('Enter a network name',1);if(pass&&pass.length<8)return to
 const m=$('#cmsg');try{await api('/api/connect',{ssid:ssid,pass:pass});m.textContent='Connecting...';
 let done=false;for(let i=0;i<32&&!done;i++){await sleep(1000);try{const s=await api('/api/status');
 if(s.state!=='connecting'){done=true;m.textContent=s.state==='connected'?'Connected to '+s.ssid:(s.reason||'Connection failed')}}catch(e){}}
-if(!done)m.textContent='No answer yet. If this page stops responding, reconnect to the repeater.'}catch(e){m.textContent='';toast(e.message,1)}};
-$('#forget').onclick=async()=>{try{await api('/api/forget',{});toast('Network removed');refresh()}catch(e){toast(e.message,1)}};
+loadSaved();if(!done)m.textContent='No answer yet. If this page stops responding, reconnect to the repeater.'}catch(e){m.textContent='';toast(e.message,1)}};
+let savedSet=new Set(),savedList=[];
+async function loadSaved(){try{const j=await api('/api/saved');savedList=j.list;savedSet=new Set(j.list.map(x=>x.ssid));
+$('#saved').innerHTML=j.list.length?j.list.map((x,i)=>'<li><span class="name">'+esc(x.ssid)+(x.current?' <small>(connected)</small>':'')+'</span><span class="row" style="gap:8px;flex:none"><button class="btn" style="padding:6px 12px" data-j="'+i+'">'+(x.current?'Reconnect':'Join')+'</button><button class="btn dan" style="padding:6px 12px" data-f="'+i+'">Forget</button></span></li>').join(''):'<li class="empty">None yet. Networks you join are remembered here.</li>';
+if(nets.length)drawNets()}catch(e){}}
+$('#saved').onclick=async e=>{const b=e.target.closest('button');if(!b)return;
+try{if(b.dataset.j!==undefined){const x=savedList[b.dataset.j];await api('/api/connect',{ssid:x.ssid,pass:''});toast('Connecting to '+x.ssid)}
+else if(b.dataset.f!==undefined){const x=savedList[b.dataset.f];if(!confirm('Forget '+x.ssid+'?'))return;await api('/api/forget',{ssid:x.ssid});toast('Network forgotten');loadSaved()}}catch(x){toast(x.message,1)}};
+$('#speedBtn').onclick=async()=>{try{await api('/api/speedtest',{});toast('Measuring download speed')}catch(e){toast(e.message,1)}};
+$('#dnsMode').onchange=()=>{$('#dnsCustomWrap').hidden=$('#dnsMode').value!=='5'};
 $('#rep').onchange=async e=>{try{await api('/api/repeater',{on:e.target.checked?1:0})}catch(x){toast(x.message,1);e.target.checked=!e.target.checked}};
 
 /* settings */
@@ -247,10 +263,10 @@ $('#ledBright').oninput=()=>$('#ledv').textContent=$('#ledBright').value+'%';
 async function loadCfg(){try{const c=await api('/api/config');
 $('#apSsid').value=c.apSsid;$('#apPass').value=c.apPass;$('#apHidden').checked=!!c.apHidden;$('#apSetupOpen').checked=!!c.apSetupOpen;$('#maxc').value=c.maxClients;
 $('#bri').value=c.brightness;$('#briv').textContent=c.brightness+'%';$('#tmo').value=c.timeout;$('#flip').checked=!!c.flip;
-$('#ledMode').value=c.ledMode;$('#ledBright').value=c.ledBright;$('#ledv').textContent=c.ledBright+'%';$('#ledCount').value=c.ledCount;$('#adcFullMv').value=c.adcFullMv;
+$('#dnsMode').value=c.dnsMode;$('#dnsCustom').value=c.dnsCustom==='0.0.0.0'?'':c.dnsCustom;$('#dnsCustomWrap').hidden=c.dnsMode!==5;$('#ledMode').value=c.ledMode;$('#ledBright').value=c.ledBright;$('#ledv').textContent=c.ledBright+'%';$('#ledCount').value=c.ledCount;$('#adcFullMv').value=c.adcFullMv;
 PINS.forEach(k=>$('#p_'+k[0]).value=c.pins[k[0]])}catch(e){toast(e.message,1)}}
 const pk=k=>'p'+k[0].toUpperCase()+k.slice(1);
-$('#saveAp').onclick=async()=>{try{const r=await api('/api/config',{apSsid:$('#apSsid').value,apPass:$('#apPass').value,apHidden:$('#apHidden').checked?1:0,apSetupOpen:$('#apSetupOpen').checked?1:0,maxClients:$('#maxc').value});
+$('#saveAp').onclick=async()=>{try{const r=await api('/api/config',{apSsid:$('#apSsid').value,apPass:$('#apPass').value,apHidden:$('#apHidden').checked?1:0,apSetupOpen:$('#apSetupOpen').checked?1:0,maxClients:$('#maxc').value,dnsMode:$('#dnsMode').value,dnsCustom:$('#dnsCustom').value});
 toast(r.apRestart?'Saved. The access point is restarting.':'Saved')}catch(e){toast(e.message,1)}};
 $('#saveDev').onclick=async()=>{const b={brightness:$('#bri').value,timeout:$('#tmo').value,flip:$('#flip').checked?1:0,
 ledMode:$('#ledMode').value,ledBright:$('#ledBright').value,ledCount:$('#ledCount').value,adcFullMv:$('#adcFullMv').value};
@@ -262,6 +278,6 @@ $('#reboot').onclick=async()=>{if(!confirm('Restart the device?'))return;try{awa
 $('#factory').onclick=async()=>{if(!confirm('Erase all settings, including the saved network?'))return;try{await api('/api/factory',{})}catch(e){}toast('Settings erased. Restarting')};
 
 window.addEventListener('resize',drawHist);
-refresh();mirror();setInterval(refresh,2000);setInterval(mirror,1000);
+loadSaved();refresh();mirror();setInterval(refresh,2000);setInterval(mirror,1000);
 </script></body></html>
 )HTML";
