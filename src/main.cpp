@@ -1783,7 +1783,7 @@ static void hCfgGet() {
   o += ",\"ledCount\":"; o += (int)cfg.ledCount;
   o += ",\"adcFullMv\":"; o += (int)cfg.adcFullMv;
   o += ",\"dnsMode\":"; o += (int)cfg.dnsMode;
-  o += ','; jStr(o, "dnsCustom", IPAddress(cfg.dnsCustom[0], cfg.dnsCustom[1], cfg.dnsCustom[2], cfg.dnsCustom[3]).toString().c_str());
+  o += ','; jStr(o, "dnsCustom", customSet() ? IPAddress(cfg.dnsCustom[0], cfg.dnsCustom[1], cfg.dnsCustom[2], cfg.dnsCustom[3]).toString().c_str() : "");
   o += ",\"pins\":{";
   for (int i = 0; i < P_COUNT; i++) {
     if (i) o += ',';

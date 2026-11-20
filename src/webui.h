@@ -263,7 +263,7 @@ $('#ledBright').oninput=()=>$('#ledv').textContent=$('#ledBright').value+'%';
 async function loadCfg(){try{const c=await api('/api/config');
 $('#apSsid').value=c.apSsid;$('#apPass').value=c.apPass;$('#apHidden').checked=!!c.apHidden;$('#apSetupOpen').checked=!!c.apSetupOpen;$('#maxc').value=c.maxClients;
 $('#bri').value=c.brightness;$('#briv').textContent=c.brightness+'%';$('#tmo').value=c.timeout;$('#flip').checked=!!c.flip;
-$('#dnsMode').value=c.dnsMode;$('#dnsCustom').value=c.dnsCustom==='0.0.0.0'?'':c.dnsCustom;$('#dnsCustomWrap').hidden=c.dnsMode!==5;$('#ledMode').value=c.ledMode;$('#ledBright').value=c.ledBright;$('#ledv').textContent=c.ledBright+'%';$('#ledCount').value=c.ledCount;$('#adcFullMv').value=c.adcFullMv;
+$('#dnsMode').value=c.dnsMode;$('#dnsCustom').value=/^\d+\.\d+\.\d+\.\d+$/.test(c.dnsCustom)?c.dnsCustom:'';$('#dnsCustomWrap').hidden=c.dnsMode!==5;$('#ledMode').value=c.ledMode;$('#ledBright').value=c.ledBright;$('#ledv').textContent=c.ledBright+'%';$('#ledCount').value=c.ledCount;$('#adcFullMv').value=c.adcFullMv;
 PINS.forEach(k=>$('#p_'+k[0]).value=c.pins[k[0]])}catch(e){toast(e.message,1)}}
 const pk=k=>'p'+k[0].toUpperCase()+k.slice(1);
 $('#saveAp').onclick=async()=>{try{const r=await api('/api/config',{apSsid:$('#apSsid').value,apPass:$('#apPass').value,apHidden:$('#apHidden').checked?1:0,apSetupOpen:$('#apSetupOpen').checked?1:0,maxClients:$('#maxc').value,dnsMode:$('#dnsMode').value,dnsCustom:$('#dnsCustom').value});
