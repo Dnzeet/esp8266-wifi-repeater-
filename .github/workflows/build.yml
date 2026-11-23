@@ -36,13 +36,13 @@ jobs:
       - name: Collect binary
         run: |
           mkdir -p dist
-          cp .pio/build/d1_mini_pro/firmware.bin dist/wifi-repeater-d1-mini-pro.bin
-          cd dist && sha256sum wifi-repeater-d1-mini-pro.bin > SHA256SUMS.txt
+          cp .pio/build/d1_mini_4mb/firmware.bin dist/wifi-repeater-d1-mini-4mb.bin
+          cd dist && sha256sum wifi-repeater-d1-mini-4mb.bin > SHA256SUMS.txt
           ls -l
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wifi-repeater-d1-mini-pro
+          name: wifi-repeater-d1-mini-4mb
           path: dist/*
 
       - name: Publish release
