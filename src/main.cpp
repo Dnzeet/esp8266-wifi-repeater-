@@ -1,4 +1,4 @@
-// ESP8266 Wi-Fi repeater for Wemos D1 mini Pro
+// ESP8266 Wi-Fi repeater for Wemos D1 mini and D1 mini Pro
 // SSD1306 128x64 UI, six-button input, battery monitor (A0), NeoPixel status, web configuration.
 
 #include <Arduino.h>
@@ -779,7 +779,7 @@ static void drawSplash() {
   oled->drawStr((128 - oled->getStrWidth("Repeater")) / 2, 51, "Repeater");
   oled->setFont(F_SM);
   char v[24];
-  snprintf(v, sizeof(v), "D1 mini Pro  v%s", FW_VERSION);
+  snprintf(v, sizeof(v), "D1 mini  v%s", FW_VERSION);
   oled->drawStr((128 - oled->getStrWidth(v)) / 2, 62, v);
 }
 
@@ -818,9 +818,29 @@ static void drawHome() {
 
   // upstream network and address
   const char *shown = conn ? connectedSsid : ((cs != CS_IDLE && pendSsid[0]) ? pendSsid : cfg.saved[0].ssid);
+  bool showNet = conn && inetKnown;
   oled->setFont(F_BIG);
-  fit(shown[0] ? shown : "No network", b, sizeof(b), 124);
+  fit(shown[0] ? shown : "No network", b, sizeof(b), showNet ? 88 : 124);
   oled->drawStr(2, 25, b);
+
+  // internet status in the top-right corner: globe with latency (alternating with the last speed test), or a cross
+  if (showNet) {
+    char t[12];
+    const uint8_t *ic = IC_GLOBE;
+    if (inetOk) {
+      bool showSpeed = speedState == 2 && speedKbps > 0 && ((millis() / 3000) % 2);
+      if (showSpeed) snprintf(t, sizeof(t), "%u.%uM", (unsigned)(speedKbps / 1000), (unsigned)((speedKbps % 1000) / 100));
+      else if (!dnsOk) strcpy(t, "DNS!");
+      else snprintf(t, sizeof(t), "%ums", (unsigned)pingMs);
+    } else {
+      ic = IC_X;
+      strcpy(t, "none");
+    }
+    oled->setFont(F_SM);
+    int x = 127 - oled->getStrWidth(t);
+    oled->drawXBMP(x - 10, 17, 8, 8, ic);
+    oled->drawStr(x, 24, t);
+  }
   oled->setFont(F_UI);
   char l2[32];
   if (conn) strlcpy(l2, WiFi.localIP().toString().c_str(), sizeof(l2));
@@ -829,23 +849,6 @@ static void drawHome() {
   else if (autoScan) strlcpy(l2, "Searching saved", sizeof(l2));
   else strlcpy(l2, haveSaved() ? "Disconnected" : "OK > Networks", sizeof(l2));
   oled->drawStr(2, 37, l2);
-
-  // internet status: globe with latency (alternating with the last speed test), or a cross
-  if (conn && inetKnown) {
-    char t[12];
-    if (inetOk) {
-      oled->drawXBMP(92, 29, 8, 8, IC_GLOBE);
-      bool showSpeed = speedState == 2 && speedKbps > 0 && ((millis() / 3000) % 2);
-      if (showSpeed) snprintf(t, sizeof(t), "%u.%uM", (unsigned)(speedKbps / 1000), (unsigned)((speedKbps % 1000) / 100));
-      else if (!dnsOk) strcpy(t, "DNS!");
-      else snprintf(t, sizeof(t), "%ums", (unsigned)pingMs);
-    } else {
-      oled->drawXBMP(92, 29, 8, 8, IC_X);
-      strcpy(t, "none");
-    }
-    oled->setFont(F_SM);
-    oled->drawStr(102, 36, t);
-  }
 
   // traffic path: uplink -> repeater -> clients
   oled->drawFrame(4, 48, 24, 6);
