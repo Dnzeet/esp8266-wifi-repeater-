@@ -1,4 +1,4 @@
-# ESP8266 Wi-Fi Repeater (Wemos D1 mini Pro)
+# ESP8266 Wi-Fi Repeater (Wemos D1 mini and D1 mini Pro)
 
 Wi-Fi repeater with a 0.96" SSD1306 OLED, six buttons, battery monitor, NeoPixel status LED and a web UI.
 Traffic is forwarded with lwIP NAPT, so clients of the repeater sit on their own subnet behind the ESP.
@@ -30,7 +30,7 @@ Notes:
 
 ## Battery
 
-The battery is read on A0 through your voltage divider. The D1 mini Pro already has a 220k/100k divider on A0, so an extra series resistor from the battery is usually all that is added.
+The battery is read on A0 through your voltage divider. The D1 mini and D1 mini Pro already have a 220k/100k divider on A0, so an extra series resistor from the battery is usually all that is added.
 
 1. Flash and open the web UI, Device > Battery.
 2. Measure the battery with a multimeter, type the value into "Calibrate" and press the button.
@@ -38,6 +38,25 @@ The battery is read on A0 through your voltage divider. The D1 mini Pro already 
 Calibration sets the "voltage that reads as full scale" value, so it accounts for your exact resistors. The default (4200 mV) matches a 100k series resistor with the onboard divider.
 
 Percent comes from a typical single-cell Li-ion discharge curve. Below 2.5 V (for example when running from USB with no battery) the screen shows USB instead of a battery. The firmware cannot tell if the battery is charging.
+
+## Saved networks
+
+Every network you join is remembered with its password (up to 8). After a restart, or when the link is lost, the repeater scans and reconnects to the strongest saved network in range, so moving between places needs no typing.
+
+- On the device: Menu > Saved shows the list. OK on an entry offers Join or Forget. In Networks, saved entries show a star and connect directly.
+- In the web UI: Connect tab, Saved networks, with Join and Forget buttons.
+- A saved network with a hidden name cannot be found by scanning, so join it manually when needed.
+- While nobody is connected to the repeater's own network, retries scan every 30 to 45 seconds. Scans pause while a device is attached, so the setup page is not disturbed.
+
+## Internet status and speed
+
+- The device checks the internet every 30 seconds (10 seconds while it looks down): a TCP connection to 1.1.1.1 (8.8.8.8 as fallback) gives the latency, and a DNS query to the selected DNS server checks name resolution. The result appears on the home screen (globe with latency, a cross, or DNS!), in Menu > Info, in the web UI Overview and in the LED (orange when connected without internet). The uplink label changes to NO NET.
+- Speed test: Menu > Speed test or the button in the web UI. It downloads up to about 6 MB over plain HTTP (speedtest.tele2.net, then ipv4.download.thinkbroadband.com as fallback) and reports Mbps. This measures the ESP8266's own download speed, so it indicates what the repeater can reach. While it runs, the device is busy for a few seconds. The last result alternates with the latency on the home screen.
+- Probes block the device for up to a couple of seconds when the internet is down. They are skipped while you are typing.
+
+## DNS
+
+Choose the DNS that connected devices receive: same as upstream (default), Cloudflare, Google, Quad9, AdGuard (blocks ads and trackers) or a custom address. Set it in the web UI (Access point tab) or cycle it from Menu > DNS with Left and Right. The core used here hands out a single DNS address. Devices pick up a change when they reconnect or renew their address.
 
 ## Status LED
 
@@ -65,13 +84,13 @@ Brightness (5-100%) and the number of pixels (1-8, all showing the same colour) 
 Home screen: link quality, channel and signal strength, battery, upstream network and address, and a live path
 uplink -> repeater -> clients that animates while traffic can flow.
 
-Menu: Networks (scan, pick, type password), Repeater (on/off), Display (brightness, timeout, flip), LED, Info, Forget network, Restart.
+Menu: Networks (scan, pick, type password), Saved (join or forget remembered networks), Repeater (on/off), DNS (cycle preset), Display (brightness, timeout, flip), LED, Speed test, Info, Restart.
 
 Keyboard keys: `abc` / `ABC` / `123` / `#+=` switch the character page, `SPC` space, `DEL` delete, `SHOW` / `HIDE` reveal the password, `OK` connects (minimum 8 characters).
 
 ## Web UI
 
-1. Join the repeater's own network. Defaults: name `ESP-Repeater`, password `repeater123`.
+1. Join the repeater's own network. Defaults: name `ESP-Repeater`. It is open (no password) while the repeater has no upstream connection, so first setup needs no password. After it connects, the access point switches to its password (default `repeater123`). Name, password and this behaviour are set under Access point.
 2. Open `http://192.168.4.1` (also shown under Menu > Info).
 3. Overview: live copy of the OLED, signal / battery / client readouts, 3-minute signal history, connected devices. Connect, Access point and Device tabs hold the settings.
 
@@ -82,17 +101,17 @@ If the upstream network also uses 192.168.4.x, the repeater moves its own networ
 
 ## Build
 
-GitHub: push this folder to a repository. `.github/workflows/build.yml` builds on every push and uploads `wifi-repeater-d1-mini-pro.bin` as an artifact. A tag such as `v1.1.0` also attaches it to a release.
+GitHub: push this folder to a repository. `.github/workflows/build.yml` builds on every push and uploads `wifi-repeater-d1-mini-4mb.bin` as an artifact. A tag such as `v1.1.0` also attaches it to a release.
 
 Local: `pio run`.
 
 ## Flash
 
 ```
-esptool.py --chip esp8266 --baud 460800 write_flash 0x0 wifi-repeater-d1-mini-pro.bin
+esptool.py --chip esp8266 --baud 460800 write_flash 0x0 wifi-repeater-d1-mini-4mb.bin
 ```
 
-Run `esptool.py erase_flash` once first. Settings from version 1.0 are discarded on the first start of 1.1.
+The image is built for 4 MB of flash, so it runs on the regular D1 mini (4 MB) and on the D1 mini Pro (16 MB, the rest stays unused). Run `esptool.py erase_flash` once first. Settings from earlier versions are discarded on the first start of this one (the storage format changed).
 
 ## Notes
 
