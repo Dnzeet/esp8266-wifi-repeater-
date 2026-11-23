@@ -94,7 +94,8 @@ p.hint{margin:8px 0 0;font-size:13px;color:var(--mute)}
 </div>
 <ul class="group"><li class="gr"><div>Repeater<small>Forward traffic between the upstream network and the access point</small></div>
 <label class="sw"><input type="checkbox" id="rep" aria-label="Repeater"><span></span></label></li></ul>
-<ul class="group" style="margin-top:8px"><li class="gr"><div>Internet<small id="inetTxt">Checking...</small></div><button class="btn" id="speedBtn">Speed test</button></li></ul>
+<ul class="group" style="margin-top:8px"><li class="gr"><div>Internet<small id="inetTxt">Checking...</small></div><button class="btn" id="speedBtn">Speed test</button></li>
+<li class="gr"><div>Traffic<small id="trafTxt">-</small></div></li></ul>
 <h2>Signal, last 3 minutes</h2>
 <div class="chart"><canvas id="hist"></canvas></div>
 <h2>Connected devices</h2>
@@ -139,11 +140,13 @@ p.hint{margin:8px 0 0;font-size:13px;color:var(--mute)}
 
 <h2>Status LED</h2>
 <p class="sub">NeoPixel on the LED data pin.</p>
-<label>Shows<select id="ledMode"><option value="0">Nothing (off)</option><option value="1">Connection status</option><option value="2">Battery level</option><option value="3">Alternate: connection, then battery</option></select></label>
+<label>Shows<select id="ledMode"><option value="0">Nothing (off)</option><option value="1">Connection status</option><option value="2">Battery level</option><option value="3">Alternate: connection, then battery</option><option value="4">Ping: green to red by latency</option></select></label>
 <label>Brightness <span class="out" id="ledv"></span><input type="range" id="ledBright" min="5" max="100" step="5"></label>
 <label>Number of pixels<select id="ledCount"></select></label>
-<p class="hint">Connection: green connected, blue connected with repeater off, amber pulse connecting, red failed or lost, violet pulse not set up. Battery: green, amber, orange, flashing red below 15%.</p>
+<p class="hint">Connection: green connected, blue connected with repeater off, amber pulse connecting, red failed or lost, violet pulse not set up. Battery: green, amber, orange, flashing red below 15%. Ping: green under 50 ms, lime under 100, amber under 200, orange above, red pulse when there is no internet, violet for a DNS problem.</p>
 <p class="hint" id="ledNow"></p>
+<label class="chk" style="margin-top:14px"><input type="checkbox" id="pingLed">Blink the onboard LED to show ping</label>
+<p class="hint">One blink under 50 ms, two under 120 ms, three when slower, one long blink for a DNS problem, rapid flicker without internet. The onboard LED is on GPIO2, which is also the default OK button: a press during a blink can be missed.</p>
 
 <h2>Battery</h2>
 <ul class="group" style="margin-bottom:16px"><li class="gr"><span>Reading</span><span id="batRead">-</span></li></ul>
@@ -171,6 +174,7 @@ const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',
 const bars=r=>{const n=r>=-55?4:r>=-65?3:r>=-75?2:r>=-85?1:0;let s='<svg width="16" height="12" viewBox="0 0 16 12" aria-hidden="true">';
 for(let i=0;i<4;i++){const h=3+i*3;s+='<rect x="'+i*4+'" y="'+(12-h)+'" width="3" height="'+h+'" fill="currentColor" opacity="'+(i<n?1:.25)+'"/>'}return s+'</svg>'};
 const upt=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h '+m+'m':h?h+'h '+m+'m':m+'m '+s%60+'s'};
+const rate=k=>k<1000?k+' kbps':(k/1000).toFixed(1)+' Mbps';
 const qual=r=>r>=-55?'Excellent':r>=-65?'Good':r>=-75?'Fair':'Weak';
 
 $$('nav button').forEach(b=>b.onclick=()=>{$$('nav button').forEach(x=>x.classList.toggle('on',x===b));
@@ -218,8 +222,9 @@ $('#kv').innerHTML=kv.map(r=>'<dt>'+r[0]+'</dt><dd>'+esc(r[1])+'</dd>').join('')
 $('#ver').textContent='Firmware '+s.fw;
 $('#ledNow').textContent='Showing now: '+s.led;
 const it=s.inet==='online'?'Online, '+s.ping+' ms, DNS '+s.dnsMs+' ms':s.inet==='nodns'?'Reachable, but DNS is not answering':s.inet==='offline'?'No internet':c?'Checking...':'Not connected';
-const sp=s.speedState===1?' | Testing...':s.speedState===2?' | '+(s.speedKbps/1000).toFixed(1)+' Mbps down':s.speedState===3?' | Speed test failed':'';
+const sp=s.speedState===1?' | Testing...':s.speedState===2?' | '+(s.speedKbps/1000).toFixed(1)+' Mbps down':s.speedState===3?' | Speed test failed'+(s.speedMsg?' ('+s.speedMsg+')':''):'';
 $('#inetTxt').textContent=it+sp;$('#speedBtn').disabled=!c||s.speedState===1;
+$('#trafTxt').textContent=c?'Down '+rate(s.dlKbps)+', up '+rate(s.ulKbps):'-';
 $('#batRead').textContent=s.batPresent?(s.batMv/1000).toFixed(2)+' V, '+s.batPct+'%, raw '+s.adcRaw:'No battery detected, raw '+s.adcRaw;
 if($('#over').classList.contains('on')){const k=await api('/api/clients');
 $('#cl').innerHTML=k.list.length?k.list.map(d=>'<li class="gr"><span>'+esc(d.ip)+'</span><span class="mono">'+esc(d.mac)+'</span></li>').join(''):'<li class="gr"><span class="mono">No devices connected</span></li>'}
@@ -263,13 +268,13 @@ $('#ledBright').oninput=()=>$('#ledv').textContent=$('#ledBright').value+'%';
 async function loadCfg(){try{const c=await api('/api/config');
 $('#apSsid').value=c.apSsid;$('#apPass').value=c.apPass;$('#apHidden').checked=!!c.apHidden;$('#apSetupOpen').checked=!!c.apSetupOpen;$('#maxc').value=c.maxClients;
 $('#bri').value=c.brightness;$('#briv').textContent=c.brightness+'%';$('#tmo').value=c.timeout;$('#flip').checked=!!c.flip;
-$('#dnsMode').value=c.dnsMode;$('#dnsCustom').value=/^\d+\.\d+\.\d+\.\d+$/.test(c.dnsCustom)?c.dnsCustom:'';$('#dnsCustomWrap').hidden=c.dnsMode!==5;$('#ledMode').value=c.ledMode;$('#ledBright').value=c.ledBright;$('#ledv').textContent=c.ledBright+'%';$('#ledCount').value=c.ledCount;$('#adcFullMv').value=c.adcFullMv;
+$('#dnsMode').value=c.dnsMode;$('#dnsCustom').value=/^\d+\.\d+\.\d+\.\d+$/.test(c.dnsCustom)?c.dnsCustom:'';$('#dnsCustomWrap').hidden=c.dnsMode!==5;$('#ledMode').value=c.ledMode;$('#pingLed').checked=!!c.pingLed;$('#ledBright').value=c.ledBright;$('#ledv').textContent=c.ledBright+'%';$('#ledCount').value=c.ledCount;$('#adcFullMv').value=c.adcFullMv;
 PINS.forEach(k=>$('#p_'+k[0]).value=c.pins[k[0]])}catch(e){toast(e.message,1)}}
 const pk=k=>'p'+k[0].toUpperCase()+k.slice(1);
 $('#saveAp').onclick=async()=>{try{const r=await api('/api/config',{apSsid:$('#apSsid').value,apPass:$('#apPass').value,apHidden:$('#apHidden').checked?1:0,apSetupOpen:$('#apSetupOpen').checked?1:0,maxClients:$('#maxc').value,dnsMode:$('#dnsMode').value,dnsCustom:$('#dnsCustom').value});
 toast(r.apRestart?'Saved. The access point is restarting.':'Saved')}catch(e){toast(e.message,1)}};
 $('#saveDev').onclick=async()=>{const b={brightness:$('#bri').value,timeout:$('#tmo').value,flip:$('#flip').checked?1:0,
-ledMode:$('#ledMode').value,ledBright:$('#ledBright').value,ledCount:$('#ledCount').value,adcFullMv:$('#adcFullMv').value};
+ledMode:$('#ledMode').value,pingLed:$('#pingLed').checked?1:0,ledBright:$('#ledBright').value,ledCount:$('#ledCount').value,adcFullMv:$('#adcFullMv').value};
 PINS.forEach(k=>{const v=$('#p_'+k[0]).value;b[pk(k[0])]=v===''?-1:v});
 try{const r=await api('/api/config',b);toast(r.restart?'Saved. Restarting to apply pins.':'Saved')}catch(e){toast(e.message,1)}};
 $('#calBtn').onclick=async()=>{const v=parseFloat($('#calV').value);if(!(v>=2&&v<=30))return toast('Enter the measured voltage in volts',1);

@@ -9,6 +9,8 @@
 #include <U8g2lib.h>
 #include <Adafruit_NeoPixel.h>
 #include <lwip/napt.h>
+#include <lwip/netif.h>
+#include <lwip/pbuf.h>
 #include <LwipDhcpServer.h>
 extern "C" {
 #include <user_interface.h>
@@ -51,6 +53,7 @@ struct Config {
   uint8_t ledCount;     // 1..8
   uint16_t adcFullMv;   // battery millivolts that read as ADC 1023
   int8_t pin[P_COUNT];
+  uint8_t pingLed;      // blink the onboard LED to show ping (appended last to keep older saved data valid)
 };
 
 static Config cfg;
@@ -58,8 +61,8 @@ static const int8_t DEFAULT_PINS[P_COUNT] = {14, 12, 13, 0, 2, 3, 4, 5, 15};
 static const uint16_t TIMEOUTS[] = {0, 15, 30, 60, 120, 300};
 static const char *const TIMEOUT_LABELS[] = {"Never", "15 s", "30 s", "1 min", "2 min", "5 min"};
 #define N_TIMEOUTS 6
-static const char *const LED_MODE[4] = {"Off", "Connection", "Battery", "Alternate"};
-static const char *const LED_MODE_SHORT[4] = {"Off", "Link", "Batt", "Alt"};
+static const char *const LED_MODE[5] = {"Off", "Connection", "Battery", "Alternate", "Ping"};
+static const char *const LED_MODE_SHORT[5] = {"Off", "Link", "Batt", "Alt", "Ping"};
 
 static void cfgSave() {
   EEPROM.put(0, cfg);
@@ -123,7 +126,8 @@ static void cfgLoad() {
   if (cfg.maxClients < 1 || cfg.maxClients > 8) cfg.maxClients = 4;
   if (cfg.apSetupOpen > 1) cfg.apSetupOpen = 1;
   if (cfg.dnsMode > 5) cfg.dnsMode = 0;
-  if (cfg.ledMode > 3) cfg.ledMode = 1;
+  if (cfg.ledMode > 4) cfg.ledMode = 1;
+  if (cfg.pingLed > 1) cfg.pingLed = 0;
   if (cfg.ledBright < 5 || cfg.ledBright > 100) cfg.ledBright = 40;
   if (cfg.ledCount < 1 || cfg.ledCount > 8) cfg.ledCount = 1;
   if (cfg.adcFullMv < 1000 || cfg.adcFullMv > 20000) cfg.adcFullMv = 4200;
@@ -238,6 +242,8 @@ static bool speedPending = false;
 static uint32_t speedKbps = 0, speedLiveKbps = 0;
 static uint8_t speedPct = 0;
 static char speedMsg[24];
+static bool builtinActive = false;
+static uint32_t builtinChangedAt = 0;
 
 static char kbBuf[64], kbSsid[33];
 static bool kbShow = false;
@@ -468,6 +474,8 @@ static void buttonsPoll() {
   for (int i = 0; i < B_COUNT; i++) {
     Button &b = btn[i];
     if (b.pin < 0) continue;
+    // the onboard LED shares GPIO2 with some button layouts: ignore that pin while it is driving the LED
+    if (b.pin == LED_BUILTIN && (builtinActive || now - builtinChangedAt < 40)) continue;
     bool raw = digitalRead(b.pin) == LOW;
     if (raw != b.raw) { b.raw = raw; b.rawSince = now; }
     if (now - b.rawSince >= 25 && raw != b.stable) {
@@ -486,6 +494,57 @@ static void buttonsPoll() {
       if (i == B_BACK && !b.longSent && now - b.downSince >= 700) { evLong[i] = true; b.longSent = true; }
     }
   }
+}
+
+// ===================================================================
+//  Traffic meter (bytes to and from devices on the access point)
+// ===================================================================
+static volatile uint32_t bytesToClients = 0, bytesFromClients = 0;
+static netif_linkoutput_fn origOut = nullptr;
+static netif_input_fn origIn = nullptr;
+static uint32_t dlKbps = 0, ulKbps = 0;
+
+static err_t IRAM_ATTR hookOut(struct netif *n, struct pbuf *p) {
+  bytesToClients += p->tot_len;
+  return origOut ? origOut(n, p) : ERR_IF;
+}
+
+static err_t IRAM_ATTR hookIn(struct pbuf *p, struct netif *n) {
+  bytesFromClients += p->tot_len;
+  return origIn ? origIn(p, n) : ERR_IF;
+}
+
+// Wraps the access point interface so every frame to or from a client is counted.
+static void trafficHook() {
+  uint32_t ap = (uint32_t)WiFi.softAPIP();
+  if (!ap) return;
+  for (struct netif *n = netif_list; n; n = n->next) {
+    if (netif_ip4_addr(n)->addr != ap) continue;
+    if (n->linkoutput != hookOut) { origOut = n->linkoutput; n->linkoutput = hookOut; }
+    if (n->input != hookIn) { origIn = n->input; n->input = hookIn; }
+    return;
+  }
+}
+
+static void trafficTick() {
+  static uint32_t last = 0, pd = 0, pu = 0, hookAt = 0;
+  uint32_t now = millis();
+  if (now - last < 1000) return;
+  uint32_t el = now - last;
+  last = now;
+  uint32_t d = bytesToClients, u = bytesFromClients;
+  uint32_t kd = (uint32_t)((uint64_t)(d - pd) * 8 / el);  // bytes * 8 / ms = kbit/s
+  uint32_t ku = (uint32_t)((uint64_t)(u - pu) * 8 / el);
+  pd = d;
+  pu = u;
+  dlKbps = (dlKbps + kd * 2) / 3;
+  ulKbps = (ulKbps + ku * 2) / 3;
+  if (now - hookAt > 3000) { hookAt = now; trafficHook(); }
+}
+
+static void fmtRate(char *o, size_t n, uint32_t k) {
+  if (k < 1000) snprintf(o, n, "%uK", (unsigned)k);
+  else snprintf(o, n, "%u.%uM", (unsigned)(k / 1000), (unsigned)((k % 1000) / 100));
 }
 
 // ===================================================================
@@ -730,12 +789,26 @@ static RGB ledBattery(const char **label) {
   return ((millis() / 300) % 2) ? RGB{255, 0, 0} : RGB{0, 0, 0};
 }
 
+static RGB ledPing(const char **label) {
+  if (cs != CS_CONNECTED) return ledConnection(label);
+  if (!inetKnown) { *label = "Checking internet"; return RGB{0, 40, 120}; }
+  if (!inetOk) { *label = "No internet"; return scale(RGB{255, 0, 0}, 60 + tri(800) * 195 / 255); }
+  if (!dnsOk) { *label = "DNS problem"; return RGB{130, 0, 255}; }
+  snprintf(ledLabelBuf, sizeof(ledLabelBuf), "Ping %u ms", (unsigned)pingMs);
+  *label = ledLabelBuf;
+  if (pingMs < 50) return RGB{0, 200, 40};
+  if (pingMs < 100) return RGB{120, 200, 0};
+  if (pingMs < 200) return RGB{255, 150, 0};
+  return RGB{255, 60, 0};
+}
+
 static RGB ledCurrent(const char **label) {
   const char *dummy;
   if (!label) label = &dummy;
   switch (cfg.ledMode) {
     case 1: return ledConnection(label);
     case 2: return ledBattery(label);
+    case 4: return ledPing(label);
     case 3: return ((millis() / 1000) % 4 < 3) ? ledConnection(label) : ledBattery(label);
     default: *label = "LED off"; return RGB{0, 0, 0};
   }
@@ -753,6 +826,31 @@ static void ledUpdate() {
   ledShown = col;
   for (int i = 0; i < cfg.ledCount; i++) pix->setPixelColor(i, col);
   pix->show();
+}
+
+// Onboard LED as a ping indicator: 1 blink under 50 ms, 2 under 120 ms, 3 slower,
+// one long blink for a DNS problem, rapid flicker when there is no internet.
+static void builtinLedUpdate() {
+  static bool on = false;
+  bool want = false;
+  if (cfg.pingLed && cs == CS_CONNECTED && inetKnown) {
+    uint32_t t = millis() % 3000;
+    if (!inetOk) want = (millis() / 125) % 2 == 0;
+    else if (!dnsOk) want = t < 600;
+    else {
+      int n = pingMs < 50 ? 1 : (pingMs < 120 ? 2 : 3);
+      want = (t < (uint32_t)n * 300) && ((t % 300) < 120);
+    }
+  }
+  if (want == on) return;
+  on = want;
+  builtinActive = on;
+  builtinChangedAt = millis();
+  bool shared = false;
+  for (int i = 0; i < B_COUNT; i++) if (cfg.pin[i] == LED_BUILTIN) shared = true;
+  if (on) { pinMode(LED_BUILTIN, OUTPUT); digitalWrite(LED_BUILTIN, LOW); }
+  else if (shared) pinMode(LED_BUILTIN, INPUT_PULLUP);
+  else { pinMode(LED_BUILTIN, OUTPUT); digitalWrite(LED_BUILTIN, HIGH); }
 }
 
 // ===================================================================
@@ -823,24 +921,34 @@ static void drawHome() {
   fit(shown[0] ? shown : "No network", b, sizeof(b), showNet ? 88 : 124);
   oled->drawStr(2, 25, b);
 
-  // internet status in the top-right corner: globe with latency (alternating with the last speed test), or a cross
-  if (showNet) {
-    char t[12];
-    const uint8_t *ic = IC_GLOBE;
-    if (inetOk) {
-      bool showSpeed = speedState == 2 && speedKbps > 0 && ((millis() / 3000) % 2);
-      if (showSpeed) snprintf(t, sizeof(t), "%u.%uM", (unsigned)(speedKbps / 1000), (unsigned)((speedKbps % 1000) / 100));
-      else if (!dnsOk) strcpy(t, "DNS!");
-      else snprintf(t, sizeof(t), "%ums", (unsigned)pingMs);
-    } else {
-      ic = IC_X;
-      strcpy(t, "none");
+  // top-right corner: internet latency (alternating with the last speed test), live traffic under it
+  if (conn) {
+    char t[12], r[10];
+    if (showNet) {
+      const uint8_t *ic = IC_GLOBE;
+      if (inetOk) {
+        bool showSpeed = speedState == 2 && speedKbps > 0 && ((millis() / 3000) % 2);
+        if (showSpeed) snprintf(t, sizeof(t), "%u.%uM", (unsigned)(speedKbps / 1000), (unsigned)((speedKbps % 1000) / 100));
+        else if (!dnsOk) strcpy(t, "DNS!");
+        else snprintf(t, sizeof(t), "%ums", (unsigned)pingMs);
+      } else {
+        ic = IC_X;
+        strcpy(t, "none");
+      }
+      oled->setFont(F_SM);
+      oled->drawXBMP(91, 16, 8, 8, ic);
+      oled->drawStr(127 - oled->getStrWidth(t), 23, t);
     }
     oled->setFont(F_SM);
-    int x = 127 - oled->getStrWidth(t);
-    oled->drawXBMP(x - 10, 17, 8, 8, ic);
-    oled->drawStr(x, 24, t);
+    for (int i = 0; i < 2; i++) {
+      fmtRate(r, sizeof(r), i ? ulKbps : dlKbps);
+      int by = 33 + i * 8;
+      if (i == 0) { oled->drawHLine(93, by - 5, 5); oled->drawHLine(94, by - 4, 3); oled->drawPixel(95, by - 3); }
+      else { oled->drawPixel(95, by - 5); oled->drawHLine(94, by - 4, 3); oled->drawHLine(93, by - 3, 5); }
+      oled->drawStr(127 - oled->getStrWidth(r), by, r);
+    }
   }
+
   oled->setFont(F_UI);
   char l2[32];
   if (conn) strlcpy(l2, WiFi.localIP().toString().c_str(), sizeof(l2));
@@ -1070,7 +1178,7 @@ static void drawDisplay() {
 
 static void drawLed() {
   header("LED");
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     int y = 14 + i * 12;
     bool sel = (ledL.sel == i);
     rowBegin(y, sel);
@@ -1079,24 +1187,28 @@ static void drawLed() {
     if (i == 0) {
       oled->drawStr(5, y + 10, "Mode");
       snprintf(v, sizeof(v), sel ? "< %s >" : "%s", LED_MODE[cfg.ledMode]);
-    } else {
+    } else if (i == 1) {
       oled->drawStr(5, y + 10, "Level");
       segBar(64, y + 3, cfg.ledBright);
       snprintf(v, sizeof(v), "%d", cfg.ledBright);
+    } else {
+      oled->drawStr(5, y + 10, "Onboard ping");
+      snprintf(v, sizeof(v), sel ? "< %s >" : "%s", cfg.pingLed ? "On" : "Off");
     }
     oled->drawStr(121 - oled->getStrWidth(v), y + 10, v);
     oled->setDrawColor(1);
   }
-  oled->drawHLine(0, 41, 128);
-  oled->setFont(F_SM);
-  oled->drawStr(3, 50, cfg.pin[P_LED] < 0 ? "LED pin not set" : "Showing now");
-  if (cfg.pin[P_LED] >= 0) {
+  oled->drawHLine(0, 51, 128);
+  if (cfg.pin[P_LED] < 0) {
+    oled->setFont(F_SM);
+    oled->drawStr(3, 62, "LED pin not set");
+  } else {
     const char *lab;
     ledCurrent(&lab);
     char t[40];
     oled->setFont(F_UI);
     fit(lab, t, sizeof(t), 122);
-    oled->drawStr(3, 61, t);
+    oled->drawStr(3, 62, t);
   }
 }
 
@@ -1501,12 +1613,13 @@ static void uiHandle() {
       break;
 
     case SC_LED:
-      if (P(B_UP)) listNav(ledL, 2, -1, 2);
-      if (P(B_DOWN)) listNav(ledL, 2, 1, 2);
+      if (P(B_UP)) listNav(ledL, 3, -1, 3);
+      if (P(B_DOWN)) listNav(ledL, 3, 1, 3);
       if (P(B_LEFT) || P(B_RIGHT)) {
         int d = P(B_RIGHT) ? 1 : -1;
-        if (ledL.sel == 0) cfg.ledMode = (uint8_t)constrain((int)cfg.ledMode + d, 0, 3);
-        else cfg.ledBright = (uint8_t)constrain((int)cfg.ledBright + d * 5, 5, 100);
+        if (ledL.sel == 0) cfg.ledMode = (uint8_t)constrain((int)cfg.ledMode + d, 0, 4);
+        else if (ledL.sel == 1) cfg.ledBright = (uint8_t)constrain((int)cfg.ledBright + d * 5, 5, 100);
+        else cfg.pingLed = !cfg.pingLed;
         ledShown = 0xFFFFFFFFu;
         cfgDirty = true;
       }
@@ -1618,7 +1731,7 @@ static void hStatus() {
   jStr(o, "gw", c ? WiFi.gatewayIP().toString().c_str() : ""); o += ',';
   jStr(o, "apSsid", cfg.apSsid); o += ',';
   jStr(o, "apIp", WiFi.softAPIP().toString().c_str()); o += ',';
-  jStr(o, "led", ledLab); o += ','; jStr(o, "dnsName", DNS_NAME[cfg.dnsMode]); o += ','; jStr(o, "dnsIp", dnsEffective().toString().c_str());
+  jStr(o, "led", ledLab); o += ','; jStr(o, "dnsName", DNS_NAME[cfg.dnsMode]); o += ','; jStr(o, "dnsIp", dnsEffective().toString().c_str()); o += ','; jStr(o, "speedMsg", speedMsg);
   o += ",\"rssi\":"; o += c ? WiFi.RSSI() : 0;
   o += ",\"channel\":"; o += c ? WiFi.channel() : 0;
   o += ",\"clients\":"; o += (int)WiFi.softAPgetStationNum();
@@ -1630,6 +1743,8 @@ static void hStatus() {
   o += ",\"dnsMs\":"; o += (int)dnsMs;
   o += ",\"speedState\":"; o += (int)speedState;
   o += ",\"speedKbps\":"; o += (uint32_t)speedKbps;
+  o += ",\"dlKbps\":"; o += (uint32_t)dlKbps;
+  o += ",\"ulKbps\":"; o += (uint32_t)ulKbps;
   o += ",\"batPresent\":"; o += batPresent ? "true" : "false";
   o += ",\"batMv\":"; o += (int)batMv;
   o += ",\"batPct\":"; o += (int)batPct;
@@ -1784,6 +1899,7 @@ static void hCfgGet() {
   o += ",\"ledMode\":"; o += (int)cfg.ledMode;
   o += ",\"ledBright\":"; o += (int)cfg.ledBright;
   o += ",\"ledCount\":"; o += (int)cfg.ledCount;
+  o += ",\"pingLed\":"; o += (int)cfg.pingLed;
   o += ",\"adcFullMv\":"; o += (int)cfg.adcFullMv;
   o += ",\"dnsMode\":"; o += (int)cfg.dnsMode;
   o += ','; jStr(o, "dnsCustom", customSet() ? IPAddress(cfg.dnsCustom[0], cfg.dnsCustom[1], cfg.dnsCustom[2], cfg.dnsCustom[3]).toString().c_str() : "");
@@ -1837,7 +1953,7 @@ static void hCfgPost() {
   if (!err && server.hasArg("flip")) n.flip = server.arg("flip") == "1";
   if (!err && server.hasArg("ledMode")) {
     int m = server.arg("ledMode").toInt();
-    if (m < 0 || m > 3) err = "Unknown LED mode"; else n.ledMode = m;
+    if (m < 0 || m > 4) err = "Unknown LED mode"; else n.ledMode = m;
   }
   if (!err && server.hasArg("ledBright")) {
     int b = server.arg("ledBright").toInt();
@@ -1848,6 +1964,7 @@ static void hCfgPost() {
     if (c < 1 || c > 8) err = "LED count must be 1-8";
     else if (c != n.ledCount) { n.ledCount = c; ledCh = true; }
   }
+  if (!err && server.hasArg("pingLed")) n.pingLed = server.arg("pingLed") == "1";
   if (!err && server.hasArg("dnsMode")) {
     int m = server.arg("dnsMode").toInt();
     if (m < 0 || m > 5) err = "Unknown DNS option";
@@ -1982,59 +2099,86 @@ static void inetProbe() {
   dirty = true;
 }
 
-static const char *const SPEED_HOST[2] = {"speedtest.tele2.net", "ipv4.download.thinkbroadband.com"};
+struct SpeedSrv { const char *host; const char *path; };
+static const SpeedSrv SPEED_SRV[4] = {
+  {"cachefly.cachefly.net", "/10mb.test"},
+  {"speedtest.tele2.net", "/10MB.zip"},
+  {"proof.ovh.net", "/files/10Mb.dat"},
+  {"ipv4.download.thinkbroadband.com", "/10MB.zip"},
+};
 
-static bool speedTry(const char *host, uint32_t &kbps) {
-  IPAddress ip;
-  if (!WiFi.hostByName(host, ip, 3000)) { strlcpy(speedMsg, "DNS lookup failed", sizeof(speedMsg)); return false; }
-  WiFiClient c;
-  c.setTimeout(3000);
-  if (!c.connect(ip, 80)) { strlcpy(speedMsg, "No connection", sizeof(speedMsg)); return false; }
-  c.print(String("GET /10MB.zip HTTP/1.0\r\nHost: ") + host + "\r\nConnection: close\r\nUser-Agent: repeater\r\n\r\n");
+// Plain-HTTP download from one server (follows up to two redirects, http only).
+static bool speedTry(const char *host0, const char *path0, uint32_t &kbps) {
+  char host[48], path[96];
+  strlcpy(host, host0, sizeof(host));
+  strlcpy(path, path0, sizeof(path));
+  for (int hop = 0; hop < 3; hop++) {
+    IPAddress ip;
+    if (!WiFi.hostByName(host, ip, 2500)) { strlcpy(speedMsg, "DNS failed", sizeof(speedMsg)); return false; }
+    WiFiClient c;
+    c.setTimeout(2500);
+    if (!c.connect(ip, 80)) { strlcpy(speedMsg, "No connection", sizeof(speedMsg)); return false; }
+    c.print(String("GET ") + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n");
 
-  char first[16] = {0};
-  int fi = 0, st = 0;
-  bool hdr = false;
-  uint32_t deadline = millis() + 5000;
-  while (!hdr && millis() < deadline) {
-    if (!c.available()) { if (!c.connected()) break; delay(1); continue; }
-    char ch = c.read();
-    if (fi < 12) first[fi++] = ch;
-    if (ch == '\r' && (st == 0 || st == 2)) st++;
-    else if (ch == '\n' && (st == 1 || st == 3)) { st++; if (st == 4) hdr = true; }
-    else st = 0;
-  }
-  if (!hdr || !strstr(first, " 200")) { c.stop(); strlcpy(speedMsg, "Server error", sizeof(speedMsg)); return false; }
-
-  static uint8_t buf[1024];
-  uint32_t bytes = 0, t0 = millis(), lastUi = t0, lastData = t0;
-  while ((c.connected() || c.available()) && millis() - t0 < 6000 && bytes < 10000000UL) {
-    int n = c.available();
-    uint32_t now = millis();
-    if (n <= 0) {
-      if (now - lastData > 3000) break;
-      delay(1);
+    int code = 0;
+    String loc;
+    bool first = true, hdr = false;
+    uint32_t deadline = millis() + 5000;
+    while (!hdr && millis() < deadline) {
+      if (!c.available()) { if (!c.connected()) break; delay(1); continue; }
+      String line = c.readStringUntil('\n');
+      line.trim();
+      if (first) { first = false; int sp = line.indexOf(' '); code = sp >= 0 ? line.substring(sp + 1).toInt() : 0; }
+      else if (line.length() == 0) hdr = true;
+      else if (line.startsWith("Location:") || line.startsWith("location:")) { loc = line.substring(9); loc.trim(); }
+    }
+    if (!hdr) { c.stop(); strlcpy(speedMsg, "No response", sizeof(speedMsg)); return false; }
+    if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+      c.stop();
+      if (!loc.startsWith("http://")) { strlcpy(speedMsg, "Redirect to HTTPS", sizeof(speedMsg)); return false; }
+      String rest = loc.substring(7);
+      int sl = rest.indexOf('/');
+      String h = sl >= 0 ? rest.substring(0, sl) : rest;
+      String pth = sl >= 0 ? rest.substring(sl) : String("/");
+      strlcpy(host, h.c_str(), sizeof(host));
+      strlcpy(path, pth.c_str(), sizeof(path));
       continue;
     }
-    if (n > (int)sizeof(buf)) n = sizeof(buf);
-    n = c.read(buf, n);
-    if (n > 0) { bytes += n; lastData = now; }
-    if (now - lastUi > 300) {
-      lastUi = now;
-      uint32_t el = now - t0;
-      if (el > 0) speedLiveKbps = (uint32_t)((uint64_t)bytes * 8 / el);
-      speedPct = (uint8_t)(el * 100 / 6000 > 100 ? 100 : el * 100 / 6000);
-      dirty = true;
-      server.handleClient();
-      uiDraw();
+    if (code != 200) { c.stop(); snprintf(speedMsg, sizeof(speedMsg), "HTTP %d", code); return false; }
+
+    static uint8_t buf[1024];
+    uint32_t bytes = 0, t0 = millis(), lastUi = t0, lastData = t0;
+    while ((c.connected() || c.available()) && millis() - t0 < 6000 && bytes < 10000000UL) {
+      int n = c.available();
+      uint32_t now = millis();
+      if (n <= 0) {
+        if (now - lastData > 3000) break;
+        delay(1);
+        continue;
+      }
+      if (n > (int)sizeof(buf)) n = sizeof(buf);
+      n = c.read(buf, n);
+      if (n > 0) { bytes += n; lastData = now; }
+      if (now - lastUi > 300) {
+        lastUi = now;
+        uint32_t el = now - t0;
+        if (el > 0) speedLiveKbps = (uint32_t)((uint64_t)bytes * 8 / el);
+        uint32_t pc = el * 100 / 6000;
+        speedPct = (uint8_t)(pc > 100 ? 100 : pc);
+        dirty = true;
+        server.handleClient();
+        uiDraw();
+      }
+      yield();
     }
-    yield();
+    c.stop();
+    uint32_t ms = millis() - t0;
+    if (ms < 300 || bytes < 20000) { strlcpy(speedMsg, "Too little data", sizeof(speedMsg)); return false; }
+    kbps = (uint32_t)((uint64_t)bytes * 8 / ms);
+    return true;
   }
-  c.stop();
-  uint32_t ms = millis() - t0;
-  if (ms < 300 || bytes < 20000) { strlcpy(speedMsg, "Too little data", sizeof(speedMsg)); return false; }
-  kbps = (uint32_t)((uint64_t)bytes * 8 / ms);
-  return true;
+  strlcpy(speedMsg, "Too many redirects", sizeof(speedMsg));
+  return false;
 }
 
 static void speedRun() {
@@ -2045,9 +2189,9 @@ static void speedRun() {
   speedMsg[0] = 0;
   dirty = true;
   uiDraw();
-  uint32_t k = 0;
+  uint32_t k = 0, began = millis();
   bool ok = false;
-  for (int i = 0; i < 2 && !ok; i++) ok = speedTry(SPEED_HOST[i], k);
+  for (int i = 0; i < 4 && !ok && millis() - began < 20000; i++) ok = speedTry(SPEED_SRV[i].host, SPEED_SRV[i].path, k);
   if (ok) { speedKbps = k; speedState = 2; }
   else speedState = 3;
   inetNext = millis() + 5000;
@@ -2074,6 +2218,7 @@ void setup() {
 
   ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
   ip_napt_enable_no(SOFTAP_IF, cfg.repeater);
+  trafficHook();
 
   webInit();
 }
@@ -2087,6 +2232,8 @@ void loop() {
   uiHandle();
   uiTick();
   ledUpdate();
+  builtinLedUpdate();
+  trafficTick();
   uiDraw();
 
   uint32_t now = millis();
