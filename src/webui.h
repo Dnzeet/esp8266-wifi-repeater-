@@ -39,6 +39,10 @@ dl.group dt{color:var(--mute)}dl.group dd{text-align:right;word-break:break-all}
 .mirror{position:relative;background:var(--scr);border-radius:8px;padding:14px;margin-bottom:10px}
 .mirror canvas{display:block;width:100%;image-rendering:pixelated;aspect-ratio:2/1}
 .mirror.off canvas{opacity:.25}
+.remote{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:300px;margin:0 auto 22px}
+.remote button{height:48px;font:inherit;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:4px;cursor:pointer;touch-action:manipulation;-webkit-user-select:none;user-select:none}
+.remote button:active{background:var(--btn);color:var(--btn-ink)}
+.remote button[data-k=ok]{background:var(--btn);color:var(--btn-ink);border-color:var(--btn)}
 .mirror span{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#7d8f9e;font-size:13px}
 .mirror.off span{display:flex}
 .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:22px}
@@ -87,6 +91,11 @@ p.hint{margin:8px 0 0;font-size:13px;color:var(--mute)}
 
 <section id="over" class="on">
 <div class="mirror" id="mirror"><canvas id="oled" width="128" height="64"></canvas><span>Screen is off</span></div>
+<div class="remote" id="remote" aria-label="Virtual buttons">
+<button data-k="back">Back</button><button data-k="up" aria-label="Up">&#9650;</button><button data-k="home">Home</button>
+<button data-k="left" aria-label="Left">&#9664;</button><button data-k="ok">OK</button><button data-k="right" aria-label="Right">&#9654;</button>
+<span></span><button data-k="down" aria-label="Down">&#9660;</button><span></span>
+</div>
 <div class="tiles">
 <div class="tile"><canvas id="v_sig"></canvas><div class="tl">Signal</div><div class="ts" id="s_sig">-</div></div>
 <div class="tile"><canvas id="v_bat"></canvas><div class="tl">Battery</div><div class="ts" id="s_bat">-</div></div>
@@ -194,6 +203,16 @@ try{const j=await api('/api/screen');$('#mirror').classList.toggle('off',!j.on);
 for(let p=0;p<8;p++)for(let x=0;x<128;x++){const v=parseInt(j.buf.substr((p*128+x)*2,2),16);
 for(let k=0;k<8;k++){const o=((p*8+k)*128+x)*4,on=(v>>k)&1;img.data[o]=on?207:4;img.data[o+1]=on?233:8;img.data[o+2]=on?255:12;img.data[o+3]=255}}
 cx.putImageData(img,0,0)}catch(e){}}
+
+/* virtual buttons: same as the six hardware buttons */
+async function key(k){try{await api('/api/key',{k:k})}catch(e){toast(e.message,1)}setTimeout(mirror,120)}
+let rep;
+$$('#remote button').forEach(b=>{const k=b.dataset.k,dir=['up','down','left','right'].indexOf(k)>=0;
+b.addEventListener('pointerdown',e=>{e.preventDefault();key(k);if(dir)rep=setTimeout(function r(){key(k);rep=setTimeout(r,130)},420)});
+['pointerup','pointerleave','pointercancel'].forEach(ev=>b.addEventListener(ev,()=>clearTimeout(rep)));
+b.addEventListener('click',e=>{if(e.detail===0)key(k)})});
+document.addEventListener('keydown',e=>{if(!$('#over').classList.contains('on'))return;const t=e.target.tagName;if(t==='INPUT'||t==='SELECT'||t==='BUTTON'||t==='TEXTAREA')return;
+const m={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'ok',Backspace:'back',Escape:'home'}[e.key];if(m){e.preventDefault();key(m)}});
 
 /* signal history */
 const hist=[],HN=90;

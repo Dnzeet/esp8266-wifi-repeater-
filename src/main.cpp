@@ -82,7 +82,7 @@ static void cfgDefaults() {
   cfg.ledMode = 1;
   cfg.ledBright = 40;
   cfg.ledCount = 1;
-  cfg.adcFullMv = 4200;
+  cfg.adcFullMv = 7400;
   memcpy(cfg.pin, DEFAULT_PINS, sizeof(cfg.pin));
 }
 
@@ -130,7 +130,7 @@ static void cfgLoad() {
   if (cfg.pingLed > 1) cfg.pingLed = 0;
   if (cfg.ledBright < 5 || cfg.ledBright > 100) cfg.ledBright = 40;
   if (cfg.ledCount < 1 || cfg.ledCount > 8) cfg.ledCount = 1;
-  if (cfg.adcFullMv < 1000 || cfg.adcFullMv > 20000) cfg.adcFullMv = 4200;
+  if (cfg.adcFullMv < 1000 || cfg.adcFullMv > 20000) cfg.adcFullMv = 7400;
   bool tOk = false;
   for (int i = 0; i < N_TIMEOUTS; i++) if (TIMEOUTS[i] == cfg.timeoutSec) tOk = true;
   if (!tOk) cfg.timeoutSec = 30;
@@ -244,6 +244,7 @@ static uint8_t speedPct = 0;
 static char speedMsg[24];
 static bool builtinActive = false;
 static uint32_t builtinChangedAt = 0;
+static volatile uint8_t vkPress = 0, vkLong = 0;  // virtual buttons pressed from the web UI
 
 static char kbBuf[64], kbSsid[33];
 static bool kbShow = false;
@@ -493,6 +494,14 @@ static void buttonsPoll() {
       if (i < B_OK && (int32_t)(now - b.nextRepeat) >= 0) { evPress[i] = true; b.nextRepeat = now + 90; }
       if (i == B_BACK && !b.longSent && now - b.downSince >= 700) { evLong[i] = true; b.longSent = true; }
     }
+  }
+  // virtual buttons from the web UI behave exactly like physical presses
+  uint8_t vp = vkPress, vl = vkLong;
+  vkPress = 0;
+  vkLong = 0;
+  for (int i = 0; i < B_COUNT; i++) {
+    if (vp & (1 << i)) evPress[i] = true;
+    if (vl & (1 << i)) evLong[i] = true;
   }
 }
 
@@ -1868,6 +1877,20 @@ static void hSpeed() {
   sendJson("{\"ok\":true}");
 }
 
+static void hKey() {
+  if (!guard()) return;
+  String k = server.arg("k");
+  if (k == "up") vkPress |= 1 << B_UP;
+  else if (k == "down") vkPress |= 1 << B_DOWN;
+  else if (k == "left") vkPress |= 1 << B_LEFT;
+  else if (k == "right") vkPress |= 1 << B_RIGHT;
+  else if (k == "ok") vkPress |= 1 << B_OK;
+  else if (k == "back") vkPress |= 1 << B_BACK;
+  else if (k == "home") vkLong |= 1 << B_BACK;  // same as holding Back
+  else { sendErr("Unknown key"); return; }
+  sendJson("{\"ok\":true}");
+}
+
 static void hRepeater() {
   if (!guard()) return;
   setRepeater(server.arg("on") == "1");
@@ -2040,6 +2063,7 @@ static void webInit() {
   server.on("/api/forget", HTTP_POST, hForget);
   server.on("/api/saved", HTTP_GET, hSaved);
   server.on("/api/speedtest", HTTP_POST, hSpeed);
+  server.on("/api/key", HTTP_POST, hKey);
   server.on("/api/repeater", HTTP_POST, hRepeater);
   server.on("/api/battery/cal", HTTP_POST, hBatCal);
   server.on("/api/config", HTTP_GET, hCfgGet);
